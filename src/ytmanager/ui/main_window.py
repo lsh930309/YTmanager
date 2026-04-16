@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QUrl, Qt
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QRadioButton,
+    QScrollArea,
     QSizePolicy,
     QSplitter,
     QStatusBar,
@@ -52,6 +53,7 @@ from ytmanager.storage import (
     DRAFT_STATUS_DRAFT,
     DRAFT_STATUS_ERROR,
     DRAFT_STATUS_REVIEWED,
+    DRAFT_STATUS_SKIPPED,
     DescriptionDraftRecord,
     AppDatabase,
     utc_now_iso,
@@ -60,8 +62,8 @@ from ytmanager.thumbnail import validate_thumbnail_file
 from ytmanager.timestamps import format_timestamp, parse_timestamp
 from ytmanager.youtube_api import YouTubeApiClient, YouTubeApiError
 
-PLAYER_WIDTH = 960
-PLAYER_HEIGHT = 540
+PLAYER_WIDTH = 720
+PLAYER_HEIGHT = 405
 SECTION_COLUMNS = ["stage_number", "boss_name", "party_composition", "party"]
 FIELD_EXCLUDES = {
     "[tags]",
@@ -175,6 +177,7 @@ class MainWindow(QMainWindow):
         self._load_cached_videos()
 
     def _build_ui(self) -> None:
+        # --- 툴바 ---
         toolbar = QToolBar("주요 작업")
         self.addToolBar(toolbar)
         login_btn = QPushButton("Google 로그인")
@@ -196,11 +199,12 @@ class MainWindow(QMainWindow):
         root_layout.setSpacing(8)
         self.setCentralWidget(root)
 
+        # --- 왼쪽: 영상 목록 (단일 줄 + 아이콘 상태) ---
         left = QWidget()
-        left.setFixedWidth(320)
+        left.setFixedWidth(300)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(6)
+        left_layout.setSpacing(4)
         left_layout.addWidget(QLabel("업로드 영상"))
         self.search = QLineEdit()
         self.search.setPlaceholderText("제목 검색")
@@ -209,8 +213,8 @@ class MainWindow(QMainWindow):
         self.video_list = QListWidget()
         self.video_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.video_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.video_list.setWordWrap(True)
-        self.video_list.setUniformItemSizes(False)
+        self.video_list.setWordWrap(False)
+        self.video_list.setUniformItemSizes(True)
         self.video_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.video_list.currentItemChanged.connect(self._on_video_selected)
         left_layout.addWidget(self.video_list, stretch=1)
@@ -219,6 +223,7 @@ class MainWindow(QMainWindow):
         main_splitter = QSplitter(Qt.Horizontal)
         root_layout.addWidget(main_splitter, stretch=1)
 
+        # --- 중앙: 재생기 + 타임스탬프 ---
         center = QWidget()
         center_layout = QVBoxLayout(center)
         center_layout.setContentsMargins(0, 0, 0, 0)
@@ -237,31 +242,6 @@ class MainWindow(QMainWindow):
         player_buttons.addWidget(timestamp_btn)
         player_buttons.addWidget(capture_btn)
         center_layout.addLayout(player_buttons)
-
-        editor_splitter = QSplitter(Qt.Vertical)
-        self.section_table = QTableWidget(0, 4)
-        self.section_table.setHorizontalHeaderLabels(["단계", "보스/제목", "파티/구성", "파티원(이름|상태|장비)"])
-        self.section_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.section_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.section_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.section_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.section_table.itemChanged.connect(self.refresh_description_preview)
-        self.section_panel = QWidget()
-        section_layout = QVBoxLayout(self.section_panel)
-        section_layout.setContentsMargins(0, 0, 0, 0)
-        section_layout.setSpacing(4)
-        section_header = QHBoxLayout()
-        section_header.addWidget(QLabel("섹션/파티원"))
-        add_section_btn = QPushButton("섹션 추가")
-        add_section_btn.clicked.connect(self.add_section_row)
-        remove_section_btn = QPushButton("선택 섹션 삭제")
-        remove_section_btn.clicked.connect(self.remove_selected_section_rows)
-        section_header.addWidget(add_section_btn)
-        section_header.addWidget(remove_section_btn)
-        section_layout.addLayout(section_header)
-        section_layout.addWidget(self.section_table)
-        editor_splitter.addWidget(self.section_panel)
-
         timestamp_panel = QWidget()
         timestamp_layout = QVBoxLayout(timestamp_panel)
         timestamp_layout.setContentsMargins(0, 0, 0, 0)
@@ -270,16 +250,17 @@ class MainWindow(QMainWindow):
         self.timestamp_editor = QPlainTextEdit()
         self.timestamp_editor.setPlaceholderText("타임스탬프가 여기에 누적됩니다. 예: 01:23 - 보스전 시작")
         self.timestamp_editor.textChanged.connect(self.refresh_description_preview)
-        timestamp_layout.addWidget(self.timestamp_editor)
-        editor_splitter.addWidget(timestamp_panel)
-        editor_splitter.setSizes([320, 150])
-        center_layout.addWidget(editor_splitter, stretch=1)
+        timestamp_layout.addWidget(self.timestamp_editor, stretch=1)
+        center_layout.addWidget(timestamp_panel, stretch=1)
         main_splitter.addWidget(center)
 
+        # --- 오른쪽: 메타데이터 + 미리보기 ---
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(6)
+
+        # 고정 상단: 제목 · 템플릿 · 상태 · 태그
         right_layout.addWidget(QLabel("제목"))
         self.title_editor = QLineEdit()
         self.title_editor.textChanged.connect(self.refresh_description_preview)
@@ -300,27 +281,69 @@ class MainWindow(QMainWindow):
 
         self.draft_status_label = QLabel("상태: 영상 미선택")
         right_layout.addWidget(self.draft_status_label)
+        right_layout.addWidget(QLabel("상단 태그"))
         self.tags_editor = QLineEdit()
         self.tags_editor.setPlaceholderText("설명 상단 태그 예: #zenlesszonezero #gacha")
         self.tags_editor.textChanged.connect(self.refresh_description_preview)
-        right_layout.addWidget(QLabel("상단 태그"))
         right_layout.addWidget(self.tags_editor)
 
+        # 수직 스플리터: [필드+섹션] | [미리보기+diff+버튼]
+        right_splitter = QSplitter(Qt.Vertical)
+        right_layout.addWidget(right_splitter, stretch=1)
+
+        # 상단: 템플릿 필드 (스크롤) + 섹션 테이블 (combat)
+        meta_panel = QWidget()
+        meta_layout = QVBoxLayout(meta_panel)
+        meta_layout.setContentsMargins(0, 4, 0, 0)
+        meta_layout.setSpacing(4)
+        meta_layout.addWidget(QLabel("템플릿 필드"))
         self.field_form_container = QWidget()
         self.field_form = QFormLayout(self.field_form_container)
         self.field_form.setContentsMargins(0, 0, 0, 0)
-        right_layout.addWidget(QLabel("템플릿 필드"))
-        right_layout.addWidget(self.field_form_container, stretch=1)
+        field_scroll = QScrollArea()
+        field_scroll.setWidget(self.field_form_container)
+        field_scroll.setWidgetResizable(True)
+        field_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        field_scroll.setMaximumHeight(220)
+        meta_layout.addWidget(field_scroll)
 
-        right_layout.addWidget(QLabel("설명 미리보기"))
+        self.section_panel = QWidget()
+        section_layout = QVBoxLayout(self.section_panel)
+        section_layout.setContentsMargins(0, 0, 0, 0)
+        section_layout.setSpacing(4)
+        section_header = QHBoxLayout()
+        section_header.addWidget(QLabel("섹션/파티원"))
+        add_section_btn = QPushButton("섹션 추가")
+        add_section_btn.clicked.connect(self.add_section_row)
+        remove_section_btn = QPushButton("선택 섹션 삭제")
+        remove_section_btn.clicked.connect(self.remove_selected_section_rows)
+        section_header.addWidget(add_section_btn)
+        section_header.addWidget(remove_section_btn)
+        section_layout.addLayout(section_header)
+        self.section_table = QTableWidget(0, 4)
+        self.section_table.setHorizontalHeaderLabels(["단계", "보스/제목", "파티/구성", "파티원(이름|상태|장비)"])
+        self.section_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.section_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.section_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.section_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.section_table.itemChanged.connect(self.refresh_description_preview)
+        section_layout.addWidget(self.section_table, stretch=1)
+        meta_layout.addWidget(self.section_panel, stretch=1)
+        right_splitter.addWidget(meta_panel)
+
+        # 하단: 설명 미리보기 + diff + 액션 버튼
+        preview_panel = QWidget()
+        preview_layout = QVBoxLayout(preview_panel)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(4)
+        preview_layout.addWidget(QLabel("설명 미리보기"))
         self.description_editor = QPlainTextEdit()
         self.description_editor.setReadOnly(True)
-        right_layout.addWidget(self.description_editor, stretch=2)
-        right_layout.addWidget(QLabel("변경사항 diff"))
+        preview_layout.addWidget(self.description_editor, stretch=2)
+        preview_layout.addWidget(QLabel("변경사항 diff"))
         self.diff_view = QPlainTextEdit()
         self.diff_view.setReadOnly(True)
-        right_layout.addWidget(self.diff_view, stretch=1)
-
+        preview_layout.addWidget(self.diff_view, stretch=1)
         draft_buttons = QHBoxLayout()
         save_btn = QPushButton("초안 저장")
         save_btn.clicked.connect(self.save_current_draft)
@@ -334,9 +357,12 @@ class MainWindow(QMainWindow):
         draft_buttons.addWidget(reviewed_btn)
         draft_buttons.addWidget(unreview_btn)
         draft_buttons.addWidget(apply_selected_btn)
-        right_layout.addLayout(draft_buttons)
+        preview_layout.addLayout(draft_buttons)
+        right_splitter.addWidget(preview_panel)
+        right_splitter.setSizes([380, 480])
+
         main_splitter.addWidget(right)
-        main_splitter.setSizes([980, 560])
+        main_splitter.setSizes([760, 580])
 
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("준비됨")
@@ -384,14 +410,28 @@ class MainWindow(QMainWindow):
     def _load_cached_videos(self) -> None:
         self._populate_videos(self.db.list_videos())
 
+    _STATUS_ICON: dict[str | None, tuple[str, str]] = {
+        DRAFT_STATUS_DRAFT:     ("✏", "#e6b800"),   # 초안 — 노란색
+        DRAFT_STATUS_REVIEWED:  ("✓", "#4caf50"),   # 검수 완료 — 초록
+        DRAFT_STATUS_APPLIED:   ("✔", "#2196f3"),   # 적용 완료 — 파랑
+        DRAFT_STATUS_ERROR:     ("✗", "#f44336"),   # 오류 — 빨강
+        DRAFT_STATUS_SKIPPED:   ("—", "#888888"),   # 건너뜀 — 회색
+        None:                   ("·", "#888888"),   # 미생성 / 대상 제외 — 회색
+    }
+
     def _populate_videos(self, videos: list[VideoSummary]) -> None:
         self.video_list.clear()
         status_map = self.db.draft_status_map()
         for video in videos:
             status = status_map.get(video.video_id)
-            status_label = STATUS_LABELS.get(status or "", "대상 제외" if not is_managed_title(video.title) else "미생성")
-            item = QListWidgetItem(f"[{status_label}] {video.title}")
-            item.setToolTip(video.title)
+            # 관리 대상이 아닌 영상은 건너뜀으로 표시
+            if status is None and not is_managed_title(video.title):
+                status = DRAFT_STATUS_SKIPPED
+            icon, color = self._STATUS_ICON.get(status, self._STATUS_ICON[None])
+            item = QListWidgetItem(f"{icon}  {video.title}")
+            item.setForeground(QColor(color))
+            tooltip_lines = [video.title, f"상태: {STATUS_LABELS.get(status or '', '미생성')}"]
+            item.setToolTip("\n".join(tooltip_lines))
             item.setData(Qt.UserRole, video)
             self.video_list.addItem(item)
 
