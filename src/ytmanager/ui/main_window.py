@@ -842,11 +842,11 @@ class MainWindow(QMainWindow):
             return
         css = (
             ".html5-video-player > div:not(.html5-video-container){"
-            "visibility:hidden!important}"
+            "visibility:hidden !important}"
             ".ytp-chrome-top,.ytp-gradient-top,.ytp-large-play-button,"
             ".ytp-cued-thumbnail-overlay,.ytp-pause-overlay,"
             ".ytp-endscreen-content,.ytp-watermark{"
-            "visibility:hidden!important}"
+            "visibility:hidden !important}"
         )
         hide_targets = (
             "'.ytp-chrome-top','.ytp-gradient-top','.ytp-large-play-button',"
