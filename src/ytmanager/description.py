@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
+from ytmanager.character_status import format_party_status, game_key_from_title_prefix, parse_party_status
 from ytmanager.models import TimestampEntry
 from ytmanager.rules import unique_tags
 from ytmanager.timestamps import parse_timestamp, render_timestamps
@@ -13,13 +14,13 @@ DEFAULT_TEMPLATE = """{[tags]}
 [{game_version} {game_content_name} {game_content_season_in_current_version}]
 
 //Section Start//
-**{optional: stage_number} {boss_name} - {party_composition}**
-- {party[i].character}: {party[i].character.M_level}{optional: party[i].character.equip}
+*{optional: stage_number} {boss_name} - {party_composition}*
+- {party[i].canonical_name} {party[i].status_label}
 //Section End//
 
--------------------
+optional: -------------------
 
-{[timestamps]}
+{optional: [timestamps]}
 """
 
 SECTION_START = "//Section Start//"
@@ -42,6 +43,15 @@ class PartyMember:
     character: str = ""
     m_level: str = ""
     equip: str = ""
+    raw_name: str = ""
+    canonical_name: str = ""
+    character_rank: str = ""
+    character_rank_value: int = -1
+    equipment_type: str = ""
+    equipment_rank: str = ""
+    equipment_rank_value: int = -1
+    raw_status: str = ""
+    parse_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -150,7 +160,7 @@ def parse_key_value_lines(text: str) -> dict[str, str]:
     return fields
 
 
-def parse_party_members(text: str) -> tuple[PartyMember, ...]:
+def parse_party_members(text: str, game_key: str | None = None) -> tuple[PartyMember, ...]:
     members: list[PartyMember] = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -158,7 +168,18 @@ def parse_party_members(text: str) -> tuple[PartyMember, ...]:
             continue
         parts = [part.strip() for part in line.split("|")]
         parts += [""] * (3 - len(parts))
-        members.append(PartyMember(character=parts[0], m_level=parts[1], equip=parts[2]))
+        parsed_member = build_party_member(parts[0], " ".join(part for part in parts[1:3] if part), game_key)
+        if parsed_member.parse_warnings and parts[1] and parts[2]:
+            parsed_member = PartyMember(
+                character=parts[0],
+                m_level=parts[1],
+                equip=parts[2],
+                raw_name=parts[0],
+                canonical_name=parts[0],
+                raw_status=" ".join(part for part in parts[1:3] if part),
+                parse_warnings=parsed_member.parse_warnings,
+            )
+        members.append(parsed_member)
     return tuple(members)
 
 
@@ -194,7 +215,7 @@ def parse_sections_text(text: str) -> tuple[DescriptionSection, ...]:
     return tuple(sections)
 
 
-def parse_description(template_text: str, description: str) -> ParsedDescription:
+def parse_description(template_text: str, description: str, title_prefix: str | None = None, game_key: str | None = None) -> ParsedDescription:
     """현재 DESCRIPTION_TEMPLATE.md 규칙에 맞춰 기존 YouTube 설명을 역파싱한다.
 
     템플릿 문법 전체를 일반화한 파서라기보다는, 현재 프로젝트의 설명 구조
@@ -202,6 +223,7 @@ def parse_description(template_text: str, description: str) -> ParsedDescription
     흐름을 안정적으로 분석하는 도메인 파서다.
     """
     del template_text  # 현재 템플릿 마커 존재 여부보다 실제 설명 형태를 우선 분석한다.
+    effective_game_key = game_key or game_key_from_title_prefix(title_prefix)
     raw_lines = [line.rstrip() for line in description.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
     lines = [line for line in raw_lines if line.strip()]
 
@@ -228,7 +250,7 @@ def parse_description(template_text: str, description: str) -> ParsedDescription
         section_lines = lines[section_start:divider_index]
         timestamp_lines = lines[divider_index + 1:]
 
-    sections, section_unmatched = _parse_rendered_sections(section_lines)
+    sections, section_unmatched = _parse_rendered_sections(section_lines, effective_game_key)
     unmatched.extend(section_unmatched)
 
     timestamps, timestamp_unmatched = _parse_rendered_timestamps(timestamp_lines)
@@ -298,7 +320,7 @@ def _is_timestamp_like_line(line: str) -> bool:
     return bool(re.match(r"^\s*(?:\d{1,2}:)?\d{1,2}:\d{2}", line))
 
 
-def _parse_rendered_sections(lines: Sequence[str]) -> tuple[tuple[DescriptionSection, ...], list[str]]:
+def _parse_rendered_sections(lines: Sequence[str], game_key: str | None = None) -> tuple[tuple[DescriptionSection, ...], list[str]]:
     sections: list[DescriptionSection] = []
     unmatched: list[str] = []
     current_fields: dict[str, str] | None = None
@@ -329,7 +351,7 @@ def _parse_rendered_sections(lines: Sequence[str]) -> tuple[tuple[DescriptionSec
             flush()
             current_fields = _parse_section_headline(headline.group("headline"))
             continue
-        party_member = _parse_rendered_party_line(stripped)
+        party_member = _parse_rendered_party_line(stripped, game_key)
         if party_member:
             if current_fields is None:
                 current_fields = {}
@@ -373,7 +395,7 @@ def _looks_like_stage_token(token: str) -> bool:
     )
 
 
-def _parse_rendered_party_line(line: str) -> PartyMember | None:
+def _parse_rendered_party_line(line: str, game_key: str | None = None) -> PartyMember | None:
     match = re.match(r"^-\s*(?P<character>[^:]+):\s*(?P<rest>.*)$", line)
     if not match:
         match = re.match(r"^-\s*(?P<character>\S+)\s*(?P<rest>.*)$", line)
@@ -383,10 +405,26 @@ def _parse_rendered_party_line(line: str) -> PartyMember | None:
     rest = match.group("rest").strip()
     if not character:
         return None
-    tokens = rest.split(maxsplit=1)
-    m_level = tokens[0] if tokens else ""
-    equip = tokens[1] if len(tokens) > 1 else ""
-    return PartyMember(character=character, m_level=m_level, equip=equip)
+    return build_party_member(character, rest, game_key)
+
+
+def build_party_member(character: str, raw_status: str, game_key: str | None = None, canonical_name: str = "") -> PartyMember:
+    parsed = parse_party_status(raw_status, game_key)
+    formatted_status = format_party_status(parsed, game_key)
+    return PartyMember(
+        character=character,
+        m_level=formatted_status,
+        equip="",
+        raw_name=character,
+        canonical_name=canonical_name or character,
+        character_rank=parsed.character_rank,
+        character_rank_value=parsed.character_rank_value,
+        equipment_type=parsed.equipment_type,
+        equipment_rank=parsed.equipment_rank,
+        equipment_rank_value=parsed.equipment_rank_value,
+        raw_status=raw_status,
+        parse_warnings=parsed.warnings,
+    )
 
 
 def _is_hashtag_only_line(line: str) -> bool:
@@ -486,9 +524,6 @@ def _render_non_section(template: str, data: DescriptionData) -> str:
     text = text.replace(SPECIAL_TIMESTAMPS_TOKEN, render_timestamps(data.timestamps))
     text = text.replace(SPECIAL_TIMESTAMP_TOKEN, render_timestamps(data.timestamps))
     text = text.replace(SPECIAL_OPT_TIMESTAMPS_TOKEN, render_timestamps(data.timestamps))
-    # 이전 기본 템플릿과의 호환성 유지
-    text = text.replace("{top_tags}", " ".join(data.top_tags))
-    text = text.replace("{timestamps}", render_timestamps(data.timestamps))
     return _render_placeholders(text, data.fields)
 
 
@@ -571,10 +606,15 @@ def _lookup_party_member_value(field_name: str, member: PartyMember) -> str:
     normalized = field_name.strip()
     mapping = {
         "character": member.character,
-        "character.M_level": member.m_level,
-        "character.equip": f" {member.equip}" if member.equip else "",
-        "equip": f" {member.equip}" if member.equip else "",
-        "M_level": member.m_level,
+        "canonical_name": member.canonical_name or member.character,
+        "raw_name": member.raw_name or member.character,
+        "status_label": member.m_level,
+        "character.character_rank": member.character_rank,
+        "character.equipment_type": member.equipment_type,
+        "character.equipment_rank": member.equipment_rank,
+        "character_rank": member.character_rank,
+        "equipment_type": member.equipment_type,
+        "equipment_rank": member.equipment_rank,
     }
     return mapping.get(normalized, "")
 

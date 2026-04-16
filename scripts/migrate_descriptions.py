@@ -11,6 +11,7 @@ from ytmanager.description import load_template
 from ytmanager.migration import build_migration_candidates, candidate_summary, candidate_to_draft_record
 from ytmanager.models import VideoSummary
 from ytmanager.oauth import OAuthManager
+from ytmanager.paths import user_data_dir
 from ytmanager.rules import load_rule_mappings
 from ytmanager.storage import AppDatabase
 from ytmanager.youtube_api import YouTubeApiClient
@@ -115,9 +116,13 @@ def main() -> int:
     applied_count = 0
     db = AppDatabase()
     try:
+        for alias_path in (Path.cwd() / "character_aliases.json", user_data_dir() / "character_aliases.json"):
+            db.load_character_aliases_from_file(alias_path)
         if not args.no_save_drafts:
             for candidate in candidates:
-                db.save_description_draft(candidate_to_draft_record(candidate), preserve_reviewed=True)
+                draft = candidate_to_draft_record(candidate)
+                if db.save_description_draft(draft, preserve_reviewed=True):
+                    db.observe_draft_roster(candidate.video, draft)
         if args.apply:
             for candidate in candidates:
                 parsed = candidate.parsed

@@ -9,6 +9,7 @@ from ytmanager.description import (
     parse_sections_text,
     render_description,
     render_description_template,
+    parse_description,
 )
 from ytmanager.models import TimestampEntry
 
@@ -18,7 +19,7 @@ class DescriptionTests(unittest.TestCase):
         self.assertEqual(extract_placeholders("{a} {b} {a}"), ["a", "b"])
 
     def test_render_description(self):
-        template = "[{game_version} {game_content_name} {game_content_season_in_current_version}]\n{top_tags}\n\n{timestamps}\n\n{notes}"
+        template = "{[tags]}\n[{game_version} {game_content_name} {game_content_season_in_current_version}]\n\n{optional: [timestamps]}\n\n{notes}"
         rendered = render_description(
             template,
             {
@@ -41,8 +42,8 @@ class DescriptionTests(unittest.TestCase):
             "[{game_version} {game_content_name} {game_content_season_in_current_version}]\n"
             "\n"
             "//Section Start//\n"
-            "**{optional: stage_number} {boss_name} - {party_composition}**\n"
-            "- {party[i].character}: {party[i].character.M_level}{optional: party[i].character.equip}\n"
+            "*{optional: stage_number} {boss_name} - {party_composition}*\n"
+            "- {party[i].canonical_name} {party[i].status_label}\n"
             "//Section End//\n"
             "\n"
             "-------------------\n"
@@ -64,7 +65,7 @@ class DescriptionTests(unittest.TestCase):
                     boss_name="니네베",
                     party_composition="강공 파티",
                     party=(
-                        PartyMember("엘렌", "M0", "전용 무기"),
+                        PartyMember("엘렌", "M0 전용 무기", ""),
                         PartyMember("리카온", "M1", ""),
                     ),
                 )
@@ -72,9 +73,9 @@ class DescriptionTests(unittest.TestCase):
         )
         self.assertIn("#zenlesszonezero", rendered)
         self.assertIn("[2.7 위험한 강습전 1차]", rendered)
-        self.assertIn("**1 니네베 - 강공 파티**", rendered)
-        self.assertIn("- 엘렌: M0 전용 무기", rendered)
-        self.assertIn("- 리카온: M1", rendered)
+        self.assertIn("*1 니네베 - 강공 파티*", rendered)
+        self.assertIn("- 엘렌 M0 전용 무기", rendered)
+        self.assertIn("- 리카온 M1", rendered)
         self.assertIn("-------------------", rendered)
         self.assertIn("01:23 - 시작", rendered)
         self.assertNotIn("//Section Start//", rendered)
@@ -97,14 +98,14 @@ class DescriptionTests(unittest.TestCase):
     def test_render_section_without_party_composition_removes_trailing_dash(self):
         template = (
             "//Section Start//\n"
-            "**{optional: stage_number} {boss_name} - {party_composition}**\n"
+            "*{optional: stage_number} {boss_name} - {party_composition}*\n"
             "//Section End//"
         )
         rendered = render_description(
             template,
             sections=[DescriptionSection(boss_name="이게 겜이지")],
         )
-        self.assertEqual(rendered, "**이게 겜이지**")
+        self.assertEqual(rendered, "*이게 겜이지*")
 
     def test_parse_sections_text(self):
         sections = parse_sections_text(
@@ -126,6 +127,22 @@ class DescriptionTests(unittest.TestCase):
         self.assertEqual(sections[0].party[0].character, "엘렌")
         self.assertEqual(sections[0].party[0].equip, "전용 무기")
 
+    def test_parse_description_structures_party_rank_and_equipment(self):
+        parsed = parse_description(
+            "",
+            "#zenlesszonezero\n[2.7 강습전 2차]\n*침식체 - 시드 전기 강공팟*\n- 시시아 1돌전엔\n- 트리거 명전\n",
+            title_prefix="젠존제",
+        )
+        first = parsed.sections[0].party[0]
+        self.assertEqual(first.character, "시시아")
+        self.assertEqual(first.character_rank, "1돌")
+        self.assertEqual(first.equipment_type, "전엔")
+        self.assertEqual(first.m_level, "1돌전엔")
+        second = parsed.sections[0].party[1]
+        self.assertEqual(second.character_rank, "명함")
+        self.assertEqual(second.equipment_type, "전엔")
+        self.assertEqual(second.m_level, "명전")
+
     def test_parse_description_preserves_timestamp_lines_without_divider(self):
         from ytmanager.description import parse_description
 
@@ -146,11 +163,9 @@ class DescriptionTests(unittest.TestCase):
             "//Template: combat//\n"
             "{[tags]}\n[{game_version} {game_content_name} {game_content_season_in_current_version}]\n"
             "//Template: gacha//\n"
-            "{[tags]}\n[{game_version} {game_content_name} {game_content_season_in_current_version}]\n\n"
-            "//Section Start//\n"
-            "**{boss_name}**\n"
-            "- {party[i].character} {party[i].character.M_level}{optional: party[i].character.equip}\n"
-            "//Section End//"
+            "{[tags]}\n[{game_version} {pickup_character_name} 가챠]\n"
+            "- 캐릭터 스택: {character_is_guaranteed} {character_stack}\n"
+            "- {equipment_type} 스택: {equipment_is_guaranteed} {equipment_stack}\n"
         )
         self.assertEqual(set(load_template_library(template)), {"combat", "gacha"})
         rendered = render_description_template(
@@ -158,20 +173,19 @@ class DescriptionTests(unittest.TestCase):
             "gacha",
             {
                 "game_version": "2.7",
-                "game_content_name": "시시아",
-                "game_content_season_in_current_version": "가챠",
+                "pickup_character_name": "시시아",
+                "character_is_guaranteed": "반천",
+                "character_stack": "0",
+                "equipment_type": "엔진",
+                "equipment_is_guaranteed": "반천",
+                "equipment_stack": "0",
             },
             ["#zenlesszonezero", "#gacha"],
-            sections=[
-                DescriptionSection(
-                    boss_name="시작 스택",
-                    party=(PartyMember("캐릭터", "반천", "0스택"), PartyMember("엔진", "반천", "0스택")),
-                )
-            ],
         )
         self.assertIn("#zenlesszonezero #gacha", rendered)
-        self.assertIn("**시작 스택**", rendered)
-        self.assertIn("- 캐릭터 반천 0스택", rendered)
+        self.assertIn("[2.7 시시아 가챠]", rendered)
+        self.assertIn("- 캐릭터 스택: 반천 0", rendered)
+        self.assertIn("- 엔진 스택: 반천 0", rendered)
 
 
     def test_load_template_library_strips_separator_lines(self):
@@ -214,7 +228,7 @@ class DescriptionTests(unittest.TestCase):
         template = (
             "//Section Start//\n"
             "*{optional: stage_number} {boss_name} - {party_composition}*\n"
-            "- {party[i].character} {party[i].character.M_level}{optional: party[i].character.equip}\n"
+            "- {party[i].canonical_name} {party[i].status_label}\n"
             "//Section End//"
         )
         rendered = render_description(
@@ -252,7 +266,7 @@ class DescriptionTests(unittest.TestCase):
         template = (
             "//Section Start//\n"
             "*{boss_name}*\n"
-            "- {party[i].character} {party[i].character.M_level}{optional: party[i].character.equip}\n"
+            "- {party[i].canonical_name} {party[i].status_label}\n"
             "//Section End//"
         )
         rendered = render_description(
@@ -260,7 +274,7 @@ class DescriptionTests(unittest.TestCase):
             sections=[
                 DescriptionSection(
                     boss_name="니네베",
-                    party=(PartyMember("엘렌", "M0", "전용 무기"),),
+                    party=(PartyMember("엘렌", "M0 전용 무기", ""),),
                 )
             ],
         )

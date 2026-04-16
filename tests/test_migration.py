@@ -10,7 +10,7 @@ TEMPLATE = """//Template: combat//
 
 //Section Start//
 *{optional: stage_number} {boss_name} - {party_composition}*
-- {party[i].character} {party[i].character.M_level}{optional: party[i].character.equip}
+- {party[i].canonical_name} {party[i].status_label}
 //Section End//
 
 //Template: gacha//
@@ -74,6 +74,8 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(draft.template_name, "combat")
         self.assertEqual(draft.fields["game_version"], "2.7")
         self.assertEqual(draft.sections[0]["boss_name"], "침식체")
+        self.assertEqual(draft.sections[0]["party"][0]["character_rank"], "1돌")
+        self.assertEqual(draft.sections[0]["party"][0]["equipment_type"], "전엔")
         self.assertEqual(draft.top_tags, ["#zenlesszonezero"])
 
 

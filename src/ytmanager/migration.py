@@ -69,7 +69,8 @@ def build_normalized_description(
             skip_reason="제목이 [] 글머리로 시작하지 않아 작업 대상이 아닙니다.",
         )
 
-    parsed = parse_description(template_text, video.description)
+    title_prefix = extract_title_prefix(video.title)
+    parsed = parse_description(template_text, video.description, title_prefix=title_prefix)
     template_name = choose_template_name(video, parsed)
     library = load_template_library(template_text)
     if template_name not in library:
@@ -204,7 +205,20 @@ def section_to_dict(section: DescriptionSection) -> dict[str, object]:
         "boss_name": section.boss_name,
         "party_composition": section.party_composition,
         "party": [
-            {"character": member.character, "m_level": member.m_level, "equip": member.equip}
+            {
+                "character": member.character,
+                "m_level": member.m_level,
+                "equip": member.equip,
+                "raw_name": member.raw_name,
+                "canonical_name": member.canonical_name,
+                "character_rank": member.character_rank,
+                "character_rank_value": member.character_rank_value,
+                "equipment_type": member.equipment_type,
+                "equipment_rank": member.equipment_rank,
+                "equipment_rank_value": member.equipment_rank_value,
+                "raw_status": member.raw_status,
+                "parse_warnings": list(member.parse_warnings),
+            }
             for member in section.party
         ],
     }

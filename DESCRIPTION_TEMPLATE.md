@@ -4,7 +4,7 @@
 
 //Section Start//
 *{optional: stage_number} {boss_name} - {party_composition}*
-- {party[i].character} {party[i].character.M_level}{optional: party[i].character.equip}
+- {party[i].canonical_name} {party[i].status_label}
 //Section End//
 
 optional: -------------------

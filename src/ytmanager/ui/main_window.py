@@ -43,11 +43,12 @@ from ytmanager.description import (
     render_description_template,
     select_template,
 )
+from ytmanager.character_status import game_key_from_title_prefix, parse_party_status, format_party_status
 from ytmanager.migration import build_migration_candidates, build_normalized_description, candidate_to_draft_record, is_managed_title
 from ytmanager.models import TimestampEntry, VideoDraft, VideoSummary
 from ytmanager.oauth import OAuthManager, OAuthSetupError
-from ytmanager.paths import user_cache_dir
-from ytmanager.rules import load_rule_mappings
+from ytmanager.paths import user_cache_dir, user_data_dir
+from ytmanager.rules import extract_title_prefix, load_rule_mappings
 from ytmanager.storage import (
     DRAFT_STATUS_APPLIED,
     DRAFT_STATUS_DRAFT,
@@ -161,6 +162,7 @@ class MainWindow(QMainWindow):
         self.resize(1660, 960)
         self.setMinimumSize(1500, 860)
         self.db = AppDatabase()
+        self._load_character_alias_files()
         self.oauth = OAuthManager()
         self.youtube: Optional[YouTubeApiClient] = None
         self.current_video: Optional[VideoSummary] = None
@@ -175,6 +177,10 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._load_cached_videos()
+
+    def _load_character_alias_files(self) -> None:
+        for alias_path in (Path.cwd() / "character_aliases.json", user_data_dir() / "character_aliases.json"):
+            self.db.load_character_aliases_from_file(alias_path)
 
     def _build_ui(self) -> None:
         # --- 툴바 ---
@@ -420,7 +426,9 @@ class MainWindow(QMainWindow):
         candidates = build_migration_candidates(videos, self.template_text, self.rule_mappings)
         saved = 0
         for candidate in candidates:
-            if self.db.save_description_draft(candidate_to_record(candidate), preserve_reviewed=True):
+            draft = candidate_to_record(candidate)
+            if self.db.save_description_draft(draft, preserve_reviewed=True):
+                self.db.observe_draft_roster(candidate.video, draft)
                 saved += 1
         return saved
 
@@ -473,6 +481,7 @@ class MainWindow(QMainWindow):
             candidate = build_normalized_description(video, self.template_text, self.rule_mappings)
             draft = candidate_to_record(candidate)
             self.db.save_description_draft(draft)
+            self.db.observe_draft_roster(video, draft)
         self._load_draft_into_ui(video, draft)
         self.statusBar().showMessage(f"선택됨: {video.title} · 원본 {video.resolution_label()} · 재생기 16:9 고정")
 
@@ -594,6 +603,7 @@ class MainWindow(QMainWindow):
 
     def _sections_from_tree(self) -> list[DescriptionSection]:
         sections: list[DescriptionSection] = []
+        game_key = game_key_from_title_prefix(extract_title_prefix(self.current_video.title if self.current_video else ""))
         for i in range(self.section_tree.topLevelItemCount()):
             sec = self.section_tree.topLevelItem(i)
             stage_number = sec.text(0).strip()
@@ -606,7 +616,23 @@ class MainWindow(QMainWindow):
                 m_level = mem.text(2).strip()
                 equip = mem.text(3).strip()
                 if character:
-                    party.append(PartyMember(character, m_level, equip))
+                    parsed = parse_party_status(" ".join(part for part in (m_level, equip) if part), game_key)
+                    party.append(
+                        PartyMember(
+                            character=character,
+                            m_level=format_party_status(parsed, game_key),
+                            equip="",
+                            raw_name=character,
+                            canonical_name=character,
+                            character_rank=parsed.character_rank,
+                            character_rank_value=parsed.character_rank_value,
+                            equipment_type=parsed.equipment_type,
+                            equipment_rank=parsed.equipment_rank,
+                            equipment_rank_value=parsed.equipment_rank_value,
+                            raw_status=parsed.raw_status,
+                            parse_warnings=parsed.warnings,
+                        )
+                    )
             if boss_name or stage_number:
                 sections.append(DescriptionSection(
                     stage_number=stage_number,
@@ -728,6 +754,8 @@ class MainWindow(QMainWindow):
         if not draft:
             return
         self.db.save_description_draft(draft, preserve_reviewed=False)
+        if self.current_video:
+            self.db.observe_draft_roster(self.current_video, draft)
         self.current_description_draft = self.db.get_description_draft(draft.video_id)
         if self.current_description_draft:
             self._set_draft_status_label(self._draft_status_text(self.current_description_draft))
@@ -739,6 +767,8 @@ class MainWindow(QMainWindow):
         if not draft:
             return
         self.db.save_description_draft(draft, preserve_reviewed=False)
+        if self.current_video:
+            self.db.observe_draft_roster(self.current_video, draft)
         self.current_description_draft = self.db.get_description_draft(draft.video_id)
         if self.current_description_draft:
             self._set_draft_status_label(self._draft_status_text(self.current_description_draft))
@@ -750,6 +780,8 @@ class MainWindow(QMainWindow):
         if not draft:
             return
         self.db.save_description_draft(draft, preserve_reviewed=False)
+        if self.current_video:
+            self.db.observe_draft_roster(self.current_video, draft)
         self.current_description_draft = self.db.get_description_draft(draft.video_id)
         if self.current_description_draft:
             self._set_draft_status_label(self._draft_status_text(self.current_description_draft))
@@ -892,7 +924,20 @@ def section_to_json(section: DescriptionSection) -> dict[str, object]:
         "boss_name": section.boss_name,
         "party_composition": section.party_composition,
         "party": [
-            {"character": member.character, "m_level": member.m_level, "equip": member.equip}
+            {
+                "character": member.character,
+                "m_level": member.m_level,
+                "equip": member.equip,
+                "raw_name": member.raw_name,
+                "canonical_name": member.canonical_name,
+                "character_rank": member.character_rank,
+                "character_rank_value": member.character_rank_value,
+                "equipment_type": member.equipment_type,
+                "equipment_rank": member.equipment_rank,
+                "equipment_rank_value": member.equipment_rank_value,
+                "raw_status": member.raw_status,
+                "parse_warnings": list(member.parse_warnings),
+            }
             for member in section.party
         ],
     }
