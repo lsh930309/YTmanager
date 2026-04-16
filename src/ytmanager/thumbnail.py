@@ -24,7 +24,7 @@ def validate_thumbnail_file(path: Path) -> ThumbnailCaptureResult:
         return ThumbnailCaptureResult(path, 0, "", False, "파일을 찾을 수 없습니다.")
     size = path.stat().st_size
     mime = detect_image_mime(path)
-    if mime not in {"image/jpeg", "image/png", "application/octet-stream"}:
+    if mime not in {"image/jpeg", "image/png"}:
         return ThumbnailCaptureResult(path, size, mime, False, "지원하지 않는 이미지 형식입니다.")
     if size > MAX_THUMBNAIL_BYTES:
         return ThumbnailCaptureResult(path, size, mime, False, "썸네일 파일은 2MB 이하여야 합니다.")

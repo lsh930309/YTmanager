@@ -4,7 +4,7 @@ import difflib
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QUrl, Qt
+from PySide6.QtCore import QTimer, QUrl, Qt
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -131,6 +131,10 @@ PLAYER_HTML = """
     function seekToSafe(seconds) {
       if (player && player.seekTo) { player.seekTo(seconds, true); }
     }
+    function togglePlayPause() {
+      if (!player || !player.getPlayerState) { return; }
+      if (player.getPlayerState() === 1) { player.pauseVideo(); } else { player.playVideo(); }
+    }
     loadApi();
   </script>
 </body>
@@ -242,13 +246,24 @@ class MainWindow(QMainWindow):
         self.player_frame = FixedVideoFrame(self.player)
         center_layout.addWidget(self.player_frame, alignment=Qt.AlignLeft | Qt.AlignTop)
         player_buttons = QHBoxLayout()
+        playpause_btn = QPushButton("재생 / 일시정지")
+        playpause_btn.clicked.connect(self._toggle_player_playback)
+        self._seek_edit = QLineEdit()
+        self._seek_edit.setPlaceholderText("00:00")
+        self._seek_edit.setFixedWidth(72)
+        seek_btn = QPushButton("탐색")
+        seek_btn.clicked.connect(self._seek_player)
         timestamp_btn = QPushButton("현재 시점을 타임스탬프로 추가")
         timestamp_btn.clicked.connect(self.add_current_timestamp)
         capture_btn = QPushButton("현재 화면을 썸네일 후보로 캡처")
         capture_btn.clicked.connect(self.capture_thumbnail_candidate)
+        player_buttons.addWidget(playpause_btn)
+        player_buttons.addWidget(self._seek_edit)
+        player_buttons.addWidget(seek_btn)
         player_buttons.addWidget(timestamp_btn)
         player_buttons.addWidget(capture_btn)
         center_layout.addLayout(player_buttons)
+        self._setup_player_css_injection()
         timestamp_panel = QWidget()
         timestamp_layout = QVBoxLayout(timestamp_panel)
         timestamp_layout.setContentsMargins(0, 0, 0, 0)
@@ -394,7 +409,7 @@ class MainWindow(QMainWindow):
 
     def login(self) -> None:
         try:
-            service = self.oauth.build_youtube_service(write_access=False)
+            service = self.oauth.build_youtube_service(write_access=True)
             self.youtube = YouTubeApiClient(service)
             self.statusBar().showMessage("Google 로그인 완료")
             QMessageBox.information(self, "로그인 완료", "Google 계정 연동이 완료되었습니다.")
@@ -820,6 +835,61 @@ class MainWindow(QMainWindow):
         self._load_cached_videos()
         self.statusBar().showMessage("검수 완료 상태를 해제했습니다.")
 
+    def _setup_player_css_injection(self) -> None:
+        try:
+            from PySide6.QtWebEngineCore import QWebEngineScript
+        except ImportError:
+            return
+        css = (
+            ".html5-video-player > div:not(.html5-video-container){"
+            "visibility:hidden!important}"
+            ".ytp-chrome-top,.ytp-gradient-top,.ytp-large-play-button,"
+            ".ytp-cued-thumbnail-overlay,.ytp-pause-overlay,"
+            ".ytp-endscreen-content,.ytp-watermark{"
+            "visibility:hidden!important}"
+        )
+        hide_targets = (
+            "'.ytp-chrome-top','.ytp-gradient-top','.ytp-large-play-button',"
+            "'.ytp-cued-thumbnail-overlay','.ytp-pause-overlay',"
+            "'.ytp-endscreen-content','.ytp-watermark'"
+        )
+        js = (
+            "(function(){"
+            "var s=document.createElement('style');"
+            f"s.textContent={repr(css)};"
+            "(document.head||document.documentElement).appendChild(s);"
+            "function h(){"
+            f"[{hide_targets}].forEach(function(c){{"
+            "document.querySelectorAll(c).forEach(function(e){"
+            "e.style.setProperty('visibility','hidden','important');});}});}"
+            "h();"
+            "new MutationObserver(h).observe("
+            "document.body||document.documentElement,"
+            "{childList:true,subtree:true});"
+            "})();"
+        )
+        script = QWebEngineScript()
+        script.setName("ytmanager_hide_overlay")
+        script.setSourceCode(js)
+        script.setInjectionPoint(QWebEngineScript.DocumentReady)
+        script.setRunsOnSubFrames(True)
+        script.setWorldId(QWebEngineScript.MainWorld)
+        self.player.page().profile().scripts().insert(script)
+
+    def _toggle_player_playback(self) -> None:
+        if not self.current_video:
+            return
+        self.player.page().runJavaScript("togglePlayPause();")
+
+    def _seek_player(self) -> None:
+        if not self.current_video:
+            return
+        try:
+            seconds = parse_timestamp(self._seek_edit.text().strip())
+        except ValueError:
+            return
+        self.player.page().runJavaScript(f"seekToSafe({seconds});")
+
     def add_current_timestamp(self) -> None:
         if not self.current_video:
             QMessageBox.information(self, "영상 선택 필요", "먼저 영상을 선택하세요.")
@@ -841,6 +911,13 @@ class MainWindow(QMainWindow):
     def capture_thumbnail_candidate(self) -> None:
         if not self.current_video:
             QMessageBox.information(self, "영상 선택 필요", "먼저 영상을 선택하세요.")
+            return
+        self.player.page().runJavaScript("if(player&&player.pauseVideo)player.pauseVideo();")
+        self.statusBar().showMessage("3초 후 캡처합니다... 마우스를 플레이어 밖으로 이동하세요.")
+        QTimer.singleShot(3000, self._do_capture_thumbnail)
+
+    def _do_capture_thumbnail(self) -> None:
+        if not self.current_video:
             return
         target = user_cache_dir() / f"thumbnail-{self.current_video.video_id}.png"
         pixmap: QPixmap = self.player.grab()

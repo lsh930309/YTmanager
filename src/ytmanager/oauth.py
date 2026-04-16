@@ -112,9 +112,13 @@ class OAuthManager:
         credentials = None
         token_info = self.token_store.load()
         if token_info:
-            credentials = Credentials.from_authorized_user_info(token_info, list(config.scopes))
-            if hasattr(credentials, "has_scopes") and not credentials.has_scopes(list(config.scopes)):
-                credentials = None
+            raw = token_info.get("scopes", "")
+            if isinstance(raw, str):
+                granted = set(raw.split())
+            else:
+                granted = set(raw or [])
+            if granted.issuperset(config.scopes):
+                credentials = Credentials.from_authorized_user_info(token_info, list(config.scopes))
         if credentials and credentials.expired and credentials.refresh_token:
             credentials.refresh(Request())
             self.token_store.save(json.loads(credentials.to_json()))
