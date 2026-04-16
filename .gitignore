@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env
+.env.*
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.nox/
+.tox/
+.coverage
+htmlcov/
+pip-wheel-metadata/
+
+# Local app/runtime state
+.omx/
+.local/
+*.db
+*.sqlite3
+logs/
+*.log
+*.tmp
+*.temp
+*.bak
+
+# OAuth/user secrets
+client_secret*.json
+credentials*.json
+token*.json
+oauth*.json
+secrets*.json
+
+# Packaging outputs
+*.manifest
+*.toc
+*.spec.bak
+*.iss.bak
+Output/
+installer/
+
+# OS/editor
+.DS_Store
+.AppleDouble
+.LSOverride
+.vscode/
+.idea/
+*.swp
+*.swo
