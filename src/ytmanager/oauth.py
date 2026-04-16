@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -39,28 +40,57 @@ class TokenStore:
         self.account_name = account_name
 
     def load(self) -> Optional[dict[str, Any]]:
+        file_token = self._token_file()
         try:
             import keyring
         except ImportError:
-            return None
-        raw = keyring.get_password(self.service_name, self.account_name)
-        if not raw:
-            return None
-        return json.loads(raw)
+            return self._load_file_token(file_token)
+        try:
+            raw = keyring.get_password(self.service_name, self.account_name)
+        except Exception:
+            raw = None
+        if raw:
+            return json.loads(raw)
+        return self._load_file_token(file_token)
 
     def save(self, token_info: dict[str, Any]) -> None:
         try:
             import keyring
-        except ImportError as exc:
-            raise OAuthSetupError("토큰 저장을 위해 keyring 패키지가 필요합니다.") from exc
-        keyring.set_password(self.service_name, self.account_name, json.dumps(token_info))
+            keyring.set_password(self.service_name, self.account_name, json.dumps(token_info))
+            return
+        except Exception:
+            # macOS 키체인은 CLI/샌드박스 실행에서 쓰기 실패할 수 있으므로
+            # 개발 환경 fallback으로 사용자 데이터 디렉터리의 토큰 파일을 사용한다.
+            self._save_file_token(token_info)
 
     def clear(self) -> None:
         try:
             import keyring
             keyring.delete_password(self.service_name, self.account_name)
         except Exception:
-            return
+            pass
+        try:
+            self._token_file().unlink()
+        except FileNotFoundError:
+            pass
+
+    def _token_file(self) -> Path:
+        return user_data_dir() / "token.json"
+
+    @staticmethod
+    def _load_file_token(path: Path) -> Optional[dict[str, Any]]:
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _save_file_token(self, token_info: dict[str, Any]) -> None:
+        path = self._token_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(token_info), encoding="utf-8")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
 
 
 class OAuthManager:

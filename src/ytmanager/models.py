@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping
 
 
 @dataclass(frozen=True)
@@ -17,12 +17,16 @@ class VideoSummary:
     privacy_status: str = ""
     published_at: str = ""
     category_id: str = "22"
+    width_pixels: int = 0
+    height_pixels: int = 0
+    display_aspect_ratio: float = 0.0
 
     @classmethod
     def from_youtube_resource(cls, resource: Mapping[str, Any]) -> "VideoSummary":
         snippet = resource.get("snippet", {}) or {}
         status = resource.get("status", {}) or {}
         content = resource.get("contentDetails", {}) or {}
+        width, height, aspect_ratio = extract_video_dimensions(resource)
         thumbnails = snippet.get("thumbnails", {}) or {}
         thumb = ""
         for key in ("maxres", "standard", "high", "medium", "default"):
@@ -39,7 +43,62 @@ class VideoSummary:
             privacy_status=str(status.get("privacyStatus", "")),
             published_at=str(snippet.get("publishedAt", "")),
             category_id=str(snippet.get("categoryId", "22")),
+            width_pixels=width,
+            height_pixels=height,
+            display_aspect_ratio=aspect_ratio,
         )
+
+    def effective_aspect_ratio(self, fallback: float = 16 / 9) -> float:
+        """GUI 재생 영역에 적용할 안전한 표시 비율을 반환한다."""
+        if self.display_aspect_ratio > 0:
+            return self.display_aspect_ratio
+        if self.width_pixels > 0 and self.height_pixels > 0:
+            return self.width_pixels / self.height_pixels
+        return fallback
+
+    def resolution_label(self) -> str:
+        if self.width_pixels > 0 and self.height_pixels > 0:
+            return f"{self.width_pixels}×{self.height_pixels}"
+        return "16:9 기본 비율"
+
+
+def extract_video_dimensions(resource: Mapping[str, Any]) -> tuple[int, int, float]:
+    """YouTube fileDetails에서 가장 큰 비디오 스트림의 해상도/비율을 추출한다."""
+    file_details = resource.get("fileDetails", {}) or {}
+    streams = file_details.get("videoStreams", []) or []
+    best_width = 0
+    best_height = 0
+    best_aspect = 0.0
+    best_area = -1
+
+    for stream in streams:
+        width = _safe_int(stream.get("widthPixels"))
+        height = _safe_int(stream.get("heightPixels"))
+        aspect = _safe_float(stream.get("aspectRatio"))
+        if width > 0 and height > 0:
+            aspect = width / height
+        area = width * height
+        if area > best_area and (area > 0 or aspect > 0):
+            best_width = width
+            best_height = height
+            best_aspect = aspect
+            best_area = area
+
+    return best_width, best_height, best_aspect
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 @dataclass

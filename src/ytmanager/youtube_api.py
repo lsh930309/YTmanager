@@ -11,6 +11,8 @@ YOUTUBE_MANAGE_SCOPE = "https://www.googleapis.com/auth/youtube"
 YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 DEFAULT_READ_SCOPES = [YOUTUBE_READONLY_SCOPE]
 DEFAULT_WRITE_SCOPES = [YOUTUBE_MANAGE_SCOPE, YOUTUBE_UPLOAD_SCOPE]
+VIDEO_LIST_PARTS = "snippet,contentDetails,status"
+VIDEO_LIST_PARTS_WITH_FILE_DETAILS = f"{VIDEO_LIST_PARTS},fileDetails"
 
 
 class YouTubeApiError(RuntimeError):
@@ -43,12 +45,44 @@ class YouTubeApiClient:
     def fetch_videos(self, video_ids: list[str]) -> list[VideoSummary]:
         if not video_ids:
             return []
-        response = self.service.videos().list(
-            part="snippet,contentDetails,status",
+        try:
+            response = self._list_video_resources(video_ids, VIDEO_LIST_PARTS_WITH_FILE_DETAILS)
+        except Exception as exc:
+            if not self._is_file_details_unavailable(exc):
+                raise
+            response = self._list_video_resources(video_ids, VIDEO_LIST_PARTS)
+        return [VideoSummary.from_youtube_resource(item) for item in response.get("items", [])]
+
+    def _list_video_resources(self, video_ids: list[str], part: str) -> Mapping[str, Any]:
+        return self.service.videos().list(
+            part=part,
             id=",".join(video_ids),
             maxResults=min(50, len(video_ids)),
         ).execute()
-        return [VideoSummary.from_youtube_resource(item) for item in response.get("items", [])]
+
+    @staticmethod
+    def _is_file_details_unavailable(exc: Exception) -> bool:
+        """fileDetails 권한/가용성 문제만 기본 part 조회로 fallback한다."""
+        try:
+            from googleapiclient.errors import HttpError
+        except ImportError:
+            return False
+        if not isinstance(exc, HttpError):
+            return False
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        content = getattr(exc, "content", b"")
+        if isinstance(content, bytes):
+            text = content.decode("utf-8", errors="ignore")
+        else:
+            text = str(content)
+        lowered = text.casefold()
+        if any(reason in lowered for reason in ("quotaexceeded", "dailylimitexceeded", "ratelimitexceeded")):
+            return False
+        if status == 400:
+            return "filedetails" in lowered or "invalidpart" in lowered
+        if status == 403:
+            return any(reason in lowered for reason in ("filedetails", "file details", "file", "processing", "forbidden"))
+        return False
 
     def list_uploaded_videos(self, limit: int = 50) -> list[VideoSummary]:
         all_ids: list[str] = []

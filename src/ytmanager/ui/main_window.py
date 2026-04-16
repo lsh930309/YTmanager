@@ -7,7 +7,12 @@ from typing import Optional
 from PySide6.QtCore import QUrl, Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QButtonGroup,
+    QFormLayout,
+    QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -16,22 +21,64 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QRadioButton,
+    QSizePolicy,
     QSplitter,
     QStatusBar,
+    QTableWidget,
+    QTableWidgetItem,
     QToolBar,
     QVBoxLayout,
     QWidget,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
-from ytmanager.description import load_template, render_description
+from ytmanager.description import (
+    DescriptionSection,
+    extract_placeholders,
+    load_template,
+    load_template_library,
+    parse_party_members,
+    render_description_template,
+    select_template,
+)
+from ytmanager.migration import build_migration_candidates, build_normalized_description, candidate_to_draft_record, is_managed_title
 from ytmanager.models import TimestampEntry, VideoDraft, VideoSummary
 from ytmanager.oauth import OAuthManager, OAuthSetupError
 from ytmanager.paths import user_cache_dir
-from ytmanager.rules import load_rule_mappings, top_tags_for_title
-from ytmanager.storage import AppDatabase
+from ytmanager.rules import load_rule_mappings
+from ytmanager.storage import (
+    DRAFT_STATUS_APPLIED,
+    DRAFT_STATUS_DRAFT,
+    DRAFT_STATUS_ERROR,
+    DRAFT_STATUS_REVIEWED,
+    DescriptionDraftRecord,
+    AppDatabase,
+    utc_now_iso,
+)
 from ytmanager.thumbnail import validate_thumbnail_file
+from ytmanager.timestamps import format_timestamp, parse_timestamp
 from ytmanager.youtube_api import YouTubeApiClient, YouTubeApiError
+
+PLAYER_WIDTH = 960
+PLAYER_HEIGHT = 540
+SECTION_COLUMNS = ["stage_number", "boss_name", "party_composition", "party"]
+FIELD_EXCLUDES = {
+    "[tags]",
+    "[timestamps]",
+    "[timestamp]",
+    "top_tags",
+    "timestamps",
+    "stage_number",
+    "boss_name",
+    "party_composition",
+}
+STATUS_LABELS = {
+    DRAFT_STATUS_DRAFT: "초안",
+    DRAFT_STATUS_REVIEWED: "검수 완료",
+    DRAFT_STATUS_APPLIED: "적용 완료",
+    DRAFT_STATUS_ERROR: "오류",
+}
 
 PLAYER_HTML = """
 <!doctype html>
@@ -39,9 +86,9 @@ PLAYER_HTML = """
 <head>
   <meta charset="utf-8">
   <style>
-    html, body { margin: 0; height: 100%; background: #111; color: #eee; font-family: sans-serif; }
-    #player { width: 100%; height: 100%; min-height: 320px; }
-    #empty { display: flex; align-items: center; justify-content: center; height: 100%; color: #aaa; }
+    html, body { margin: 0; width: 100%; height: 100%; background: #111; overflow: hidden; color: #eee; font-family: sans-serif; }
+    #player { width: 100%; height: 100%; }
+    #empty { display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; color: #aaa; }
   </style>
 </head>
 <body>
@@ -56,9 +103,7 @@ PLAYER_HTML = """
       firstScriptTag.parentNode.insertBefore(tag, firstScriptTag);
     }
     function onYouTubeIframeAPIReady() {
-      if (pendingVideoId) {
-        loadVideo(pendingVideoId);
-      }
+      if (pendingVideoId) { loadVideo(pendingVideoId); }
     }
     function loadVideo(videoId) {
       pendingVideoId = videoId;
@@ -89,19 +134,42 @@ PLAYER_HTML = """
 """
 
 
+class FixedVideoFrame(QWidget):
+    """여백 없이 고정 16:9 크기로 재생기를 담는 컨테이너."""
+
+    def __init__(self, child: QWidget, width: int = PLAYER_WIDTH, height: int = PLAYER_HEIGHT) -> None:
+        super().__init__()
+        self.child = child
+        self.child.setParent(self)
+        self.setFixedSize(width, height)
+        self.child.setGeometry(0, 0, width, height)
+        self.child.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.setStyleSheet("background-color: #111;")
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self.child.setGeometry(self.contentsRect())
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("YTmanager - YouTube 영상 관리")
-        self.resize(1400, 850)
+        self.resize(1660, 960)
+        self.setMinimumSize(1500, 860)
         self.db = AppDatabase()
         self.oauth = OAuthManager()
         self.youtube: Optional[YouTubeApiClient] = None
         self.current_video: Optional[VideoSummary] = None
         self.current_draft: Optional[VideoDraft] = None
-        self.timestamps: list[TimestampEntry] = []
+        self.current_description_draft: Optional[DescriptionDraftRecord] = None
         self.template_text = load_template()
+        self.template_library = load_template_library(self.template_text)
         self.rule_mappings = load_rule_mappings()
+        self.field_edits: dict[str, QLineEdit] = {}
+        self.template_buttons: dict[str, QRadioButton] = {}
+        self._loading_ui = False
 
         self._build_ui()
         self._load_cached_videos()
@@ -113,33 +181,54 @@ class MainWindow(QMainWindow):
         login_btn.clicked.connect(self.login)
         sync_btn = QPushButton("영상 목록 동기화")
         sync_btn.clicked.connect(self.sync_videos)
-        apply_btn = QPushButton("YouTube에 적용")
-        apply_btn.clicked.connect(self.apply_changes)
+        draft_btn = QPushButton("정규화 초안 생성")
+        draft_btn.clicked.connect(self.generate_drafts_for_cached_videos)
+        bulk_apply_btn = QPushButton("검수 완료 변경분 일괄 적용")
+        bulk_apply_btn.clicked.connect(self.apply_reviewed_drafts)
         toolbar.addWidget(login_btn)
         toolbar.addWidget(sync_btn)
-        toolbar.addWidget(apply_btn)
+        toolbar.addWidget(draft_btn)
+        toolbar.addWidget(bulk_apply_btn)
 
-        splitter = QSplitter(Qt.Horizontal)
-        self.setCentralWidget(splitter)
+        root = QWidget()
+        root_layout = QHBoxLayout(root)
+        root_layout.setContentsMargins(8, 8, 8, 8)
+        root_layout.setSpacing(8)
+        self.setCentralWidget(root)
 
         left = QWidget()
+        left.setFixedWidth(320)
         left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
         left_layout.addWidget(QLabel("업로드 영상"))
         self.search = QLineEdit()
         self.search.setPlaceholderText("제목 검색")
         self.search.textChanged.connect(self._filter_video_list)
         left_layout.addWidget(self.search)
         self.video_list = QListWidget()
+        self.video_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.video_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.video_list.setWordWrap(True)
+        self.video_list.setUniformItemSizes(False)
+        self.video_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.video_list.currentItemChanged.connect(self._on_video_selected)
-        left_layout.addWidget(self.video_list)
-        splitter.addWidget(left)
+        left_layout.addWidget(self.video_list, stretch=1)
+        root_layout.addWidget(left)
+
+        main_splitter = QSplitter(Qt.Horizontal)
+        root_layout.addWidget(main_splitter, stretch=1)
 
         center = QWidget()
         center_layout = QVBoxLayout(center)
-        center_layout.addWidget(QLabel("재생 및 시점 지정"))
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(6)
+        self.player_title = QLabel(f"재생기 · 고정 16:9 ({PLAYER_WIDTH}×{PLAYER_HEIGHT})")
+        center_layout.addWidget(self.player_title)
         self.player = QWebEngineView()
         self.player.setHtml(PLAYER_HTML, QUrl("https://ytmanager.local/"))
-        center_layout.addWidget(self.player, stretch=1)
+        self.player_frame = FixedVideoFrame(self.player)
+        center_layout.addWidget(self.player_frame, alignment=Qt.AlignLeft | Qt.AlignTop)
         player_buttons = QHBoxLayout()
         timestamp_btn = QPushButton("현재 시점을 타임스탬프로 추가")
         timestamp_btn.clicked.connect(self.add_current_timestamp)
@@ -148,36 +237,110 @@ class MainWindow(QMainWindow):
         player_buttons.addWidget(timestamp_btn)
         player_buttons.addWidget(capture_btn)
         center_layout.addLayout(player_buttons)
+
+        editor_splitter = QSplitter(Qt.Vertical)
+        self.section_table = QTableWidget(0, 4)
+        self.section_table.setHorizontalHeaderLabels(["단계", "보스/제목", "파티/구성", "파티원(이름|상태|장비)"])
+        self.section_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.section_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.section_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.section_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.section_table.itemChanged.connect(self.refresh_description_preview)
+        self.section_panel = QWidget()
+        section_layout = QVBoxLayout(self.section_panel)
+        section_layout.setContentsMargins(0, 0, 0, 0)
+        section_layout.setSpacing(4)
+        section_header = QHBoxLayout()
+        section_header.addWidget(QLabel("섹션/파티원"))
+        add_section_btn = QPushButton("섹션 추가")
+        add_section_btn.clicked.connect(self.add_section_row)
+        remove_section_btn = QPushButton("선택 섹션 삭제")
+        remove_section_btn.clicked.connect(self.remove_selected_section_rows)
+        section_header.addWidget(add_section_btn)
+        section_header.addWidget(remove_section_btn)
+        section_layout.addLayout(section_header)
+        section_layout.addWidget(self.section_table)
+        editor_splitter.addWidget(self.section_panel)
+
+        timestamp_panel = QWidget()
+        timestamp_layout = QVBoxLayout(timestamp_panel)
+        timestamp_layout.setContentsMargins(0, 0, 0, 0)
+        timestamp_layout.setSpacing(4)
+        timestamp_layout.addWidget(QLabel("타임스탬프"))
         self.timestamp_editor = QPlainTextEdit()
         self.timestamp_editor.setPlaceholderText("타임스탬프가 여기에 누적됩니다. 예: 01:23 - 보스전 시작")
         self.timestamp_editor.textChanged.connect(self.refresh_description_preview)
-        center_layout.addWidget(self.timestamp_editor)
-        splitter.addWidget(center)
+        timestamp_layout.addWidget(self.timestamp_editor)
+        editor_splitter.addWidget(timestamp_panel)
+        editor_splitter.setSizes([320, 150])
+        center_layout.addWidget(editor_splitter, stretch=1)
+        main_splitter.addWidget(center)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
         right_layout.addWidget(QLabel("제목"))
         self.title_editor = QLineEdit()
         self.title_editor.textChanged.connect(self.refresh_description_preview)
         right_layout.addWidget(self.title_editor)
-        right_layout.addWidget(QLabel("구조화 필드"))
-        self.fields_editor = QPlainTextEdit()
-        self.fields_editor.setPlaceholderText("game_version=2.7\ngame_content_name=위험한 강습전\ngame_content_season_in_current_version=1차\nnotes=자유 메모")
-        self.fields_editor.textChanged.connect(self.refresh_description_preview)
-        right_layout.addWidget(self.fields_editor)
+
+        template_group = QGroupBox("템플릿")
+        template_layout = QHBoxLayout(template_group)
+        self.template_button_group = QButtonGroup(self)
+        for index, name in enumerate(self.template_library.keys()):
+            button = QRadioButton(name)
+            self.template_button_group.addButton(button)
+            self.template_buttons[name] = button
+            template_layout.addWidget(button)
+            if index == 0:
+                button.setChecked(True)
+            button.toggled.connect(self._on_template_changed)
+        right_layout.addWidget(template_group)
+
+        self.draft_status_label = QLabel("상태: 영상 미선택")
+        right_layout.addWidget(self.draft_status_label)
+        self.tags_editor = QLineEdit()
+        self.tags_editor.setPlaceholderText("설명 상단 태그 예: #zenlesszonezero #gacha")
+        self.tags_editor.textChanged.connect(self.refresh_description_preview)
+        right_layout.addWidget(QLabel("상단 태그"))
+        right_layout.addWidget(self.tags_editor)
+
+        self.field_form_container = QWidget()
+        self.field_form = QFormLayout(self.field_form_container)
+        self.field_form.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(QLabel("템플릿 필드"))
+        right_layout.addWidget(self.field_form_container, stretch=1)
+
         right_layout.addWidget(QLabel("설명 미리보기"))
         self.description_editor = QPlainTextEdit()
-        self.description_editor.textChanged.connect(self.refresh_diff)
-        right_layout.addWidget(self.description_editor, stretch=1)
+        self.description_editor.setReadOnly(True)
+        right_layout.addWidget(self.description_editor, stretch=2)
         right_layout.addWidget(QLabel("변경사항 diff"))
         self.diff_view = QPlainTextEdit()
         self.diff_view.setReadOnly(True)
         right_layout.addWidget(self.diff_view, stretch=1)
-        splitter.addWidget(right)
-        splitter.setSizes([300, 550, 550])
+
+        draft_buttons = QHBoxLayout()
+        save_btn = QPushButton("초안 저장")
+        save_btn.clicked.connect(self.save_current_draft)
+        reviewed_btn = QPushButton("검수 완료")
+        reviewed_btn.clicked.connect(self.mark_current_reviewed)
+        unreview_btn = QPushButton("검수 해제")
+        unreview_btn.clicked.connect(self.unreview_current_draft)
+        apply_selected_btn = QPushButton("선택 적용")
+        apply_selected_btn.clicked.connect(self.apply_selected_draft)
+        draft_buttons.addWidget(save_btn)
+        draft_buttons.addWidget(reviewed_btn)
+        draft_buttons.addWidget(unreview_btn)
+        draft_buttons.addWidget(apply_selected_btn)
+        right_layout.addLayout(draft_buttons)
+        main_splitter.addWidget(right)
+        main_splitter.setSizes([980, 560])
 
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("준비됨")
+        self._rebuild_field_form(self._selected_template_name(), {})
 
     def login(self) -> None:
         try:
@@ -196,20 +359,39 @@ class MainWindow(QMainWindow):
             if not self.youtube:
                 return
         try:
-            videos = self.youtube.list_uploaded_videos(limit=50)
+            videos = self.youtube.list_uploaded_videos(limit=200)
             self.db.save_videos(videos)
+            self._generate_drafts(videos)
             self._populate_videos(videos)
-            self.statusBar().showMessage(f"영상 {len(videos)}개를 동기화했습니다.")
+            self.statusBar().showMessage(f"영상 {len(videos)}개를 동기화하고 정규화 초안을 갱신했습니다.")
         except Exception as exc:
             QMessageBox.critical(self, "동기화 실패", f"영상 목록을 가져오지 못했습니다.\n\n{exc}")
+
+    def generate_drafts_for_cached_videos(self) -> None:
+        videos = self.db.list_videos()
+        created = self._generate_drafts(videos)
+        self._populate_videos(videos)
+        QMessageBox.information(self, "초안 생성", f"정규화 초안 {created}개를 저장했습니다.\n검수 완료/적용 완료 상태의 초안은 덮어쓰지 않았습니다.")
+
+    def _generate_drafts(self, videos: list[VideoSummary]) -> int:
+        candidates = build_migration_candidates(videos, self.template_text, self.rule_mappings)
+        saved = 0
+        for candidate in candidates:
+            if self.db.save_description_draft(candidate_to_record(candidate), preserve_reviewed=True):
+                saved += 1
+        return saved
 
     def _load_cached_videos(self) -> None:
         self._populate_videos(self.db.list_videos())
 
     def _populate_videos(self, videos: list[VideoSummary]) -> None:
         self.video_list.clear()
+        status_map = self.db.draft_status_map()
         for video in videos:
-            item = QListWidgetItem(video.title)
+            status = status_map.get(video.video_id)
+            status_label = STATUS_LABELS.get(status or "", "대상 제외" if not is_managed_title(video.title) else "미생성")
+            item = QListWidgetItem(f"[{status_label}] {video.title}")
+            item.setToolTip(video.title)
             item.setData(Qt.UserRole, video)
             self.video_list.addItem(item)
 
@@ -228,31 +410,157 @@ class MainWindow(QMainWindow):
             return
         self.current_video = video
         self.current_draft = VideoDraft.from_video(video)
-        self.timestamps = []
-        self.title_editor.setText(video.title)
-        self.description_editor.setPlainText(video.description)
-        self.timestamp_editor.setPlainText("")
-        self.fields_editor.setPlainText("")
         self.player.page().runJavaScript(f"loadVideo({video.video_id!r});")
-        self.refresh_diff()
-        self.statusBar().showMessage(f"선택됨: {video.title}")
+        draft = self.db.get_description_draft(video.video_id)
+        if draft is None and is_managed_title(video.title):
+            candidate = build_normalized_description(video, self.template_text, self.rule_mappings)
+            draft = candidate_to_record(candidate)
+            self.db.save_description_draft(draft)
+        self._load_draft_into_ui(video, draft)
+        self.statusBar().showMessage(f"선택됨: {video.title} · 원본 {video.resolution_label()} · 재생기 16:9 고정")
 
-    def _parse_fields(self) -> dict[str, str]:
-        fields: dict[str, str] = {}
-        for line in self.fields_editor.toPlainText().splitlines():
-            if not line.strip() or "=" not in line:
+    def _load_draft_into_ui(self, video: VideoSummary, draft: DescriptionDraftRecord | None) -> None:
+        self._loading_ui = True
+        self.current_description_draft = draft
+        self.title_editor.setText(video.title)
+        self.section_table.setRowCount(0)
+        self.timestamp_editor.setPlainText("")
+        if draft is None:
+            self._set_template_name("combat")
+            self.section_panel.setVisible(True)
+            self.tags_editor.setText("")
+            self._rebuild_field_form(self._selected_template_name(), {})
+            self.description_editor.setPlainText(video.description)
+            self._set_draft_status_label("상태: 작업 대상 제외")
+            self._loading_ui = False
+            self.refresh_diff()
+            return
+        self._set_template_name(draft.template_name)
+        self.section_panel.setVisible(draft.template_name != "gacha")
+        self.tags_editor.setText(" ".join(draft.top_tags))
+        self._rebuild_field_form(draft.template_name, draft.fields)
+        self._set_sections_from_json(draft.sections)
+        self._set_timestamps_from_json(draft.timestamps)
+        self.description_editor.setPlainText(draft.rendered_description)
+        self._set_draft_status_label(self._draft_status_text(draft))
+        self._loading_ui = False
+        self.refresh_description_preview()
+
+    def _draft_status_text(self, draft: DescriptionDraftRecord) -> str:
+        base = STATUS_LABELS.get(draft.status, draft.status)
+        parts = [f"상태: {base}"]
+        if draft.parse_confidence:
+            parts.append(f"신뢰도: {draft.parse_confidence}")
+        if draft.warnings or draft.unmatched_lines:
+            parts.append(f"확인 필요: {len(draft.warnings) + len(draft.unmatched_lines)}건")
+        if draft.error_message:
+            parts.append(f"오류: {draft.error_message}")
+        return " · ".join(parts)
+
+    def _set_draft_status_label(self, text: str) -> None:
+        self.draft_status_label.setText(text)
+
+    def _selected_template_name(self) -> str:
+        for name, button in self.template_buttons.items():
+            if button.isChecked():
+                return name
+        return next(iter(self.template_library.keys()), "combat")
+
+    def _set_template_name(self, name: str) -> None:
+        button = self.template_buttons.get(name) or self.template_buttons.get("combat")
+        if button:
+            button.setChecked(True)
+
+    def _on_template_changed(self, checked: bool = False) -> None:
+        del checked
+        if self._loading_ui:
+            return
+        template_name = self._selected_template_name()
+        self.section_panel.setVisible(template_name != "gacha")
+        self._rebuild_field_form(template_name, self._current_fields())
+        self.refresh_description_preview()
+
+    def _rebuild_field_form(self, template_name: str, values: dict[str, str]) -> None:
+        while self.field_form.rowCount():
+            self.field_form.removeRow(0)
+        self.field_edits = {}
+        placeholders = extract_placeholders(select_template(self.template_text, template_name))
+        field_names = [name for name in placeholders if self._is_general_field_name(name)]
+        if template_name == "freeform" and "body" not in field_names:
+            field_names.append("body")
+        for name in field_names:
+            edit = QLineEdit()
+            edit.setText(values.get(name, ""))
+            edit.textChanged.connect(self.refresh_description_preview)
+            self.field_form.addRow(name, edit)
+            self.field_edits[name] = edit
+
+    def _is_general_field_name(self, name: str) -> bool:
+        return name not in FIELD_EXCLUDES and "[i]" not in name and not name.startswith("party")
+
+    def _current_fields(self) -> dict[str, str]:
+        return {name: edit.text().strip() for name, edit in self.field_edits.items() if edit.text().strip()}
+
+    def add_section_row(self) -> None:
+        row = self.section_table.rowCount()
+        self.section_table.insertRow(row)
+        for column in range(self.section_table.columnCount()):
+            self.section_table.setItem(row, column, QTableWidgetItem(""))
+
+    def remove_selected_section_rows(self) -> None:
+        rows = sorted({index.row() for index in self.section_table.selectedIndexes()}, reverse=True)
+        for row in rows:
+            self.section_table.removeRow(row)
+        self.refresh_description_preview()
+
+    def _sections_from_table(self) -> list[DescriptionSection]:
+        sections: list[DescriptionSection] = []
+        for row in range(self.section_table.rowCount()):
+            values = [self._table_text(row, column) for column in range(4)]
+            if not any(values):
                 continue
-            key, value = line.split("=", 1)
-            fields[key.strip()] = value.strip()
-        return fields
+            sections.append(
+                DescriptionSection(
+                    stage_number=values[0],
+                    boss_name=values[1],
+                    party_composition=values[2],
+                    party=parse_party_members(values[3]),
+                )
+            )
+        return sections
 
-    def _parse_timestamp_editor(self) -> list[TimestampEntry]:
+    def _table_text(self, row: int, column: int) -> str:
+        item = self.section_table.item(row, column)
+        return item.text().strip() if item else ""
+
+    def _set_sections_from_json(self, sections: list[dict[str, object]]) -> None:
+        self.section_table.blockSignals(True)
+        self.section_table.setRowCount(0)
+        for section in sections:
+            row = self.section_table.rowCount()
+            self.section_table.insertRow(row)
+            party = section.get("party", []) if isinstance(section, dict) else []
+            party_lines = []
+            if isinstance(party, list):
+                for member in party:
+                    if isinstance(member, dict):
+                        party_lines.append("|".join(str(member.get(key, "")) for key in ("character", "m_level", "equip")))
+            values = [
+                str(section.get("stage_number", "")),
+                str(section.get("boss_name", "")),
+                str(section.get("party_composition", "")),
+                "\n".join(party_lines),
+            ]
+            for column, value in enumerate(values):
+                self.section_table.setItem(row, column, QTableWidgetItem(value))
+        self.section_table.blockSignals(False)
+
+    def _timestamps_from_editor(self) -> list[TimestampEntry]:
         entries: list[TimestampEntry] = []
         for line in self.timestamp_editor.toPlainText().splitlines():
             if not line.strip():
                 continue
             stamp, _, label = line.partition("-")
-            from ytmanager.timestamps import parse_timestamp
             try:
                 seconds = parse_timestamp(stamp.strip())
             except ValueError:
@@ -260,15 +568,36 @@ class MainWindow(QMainWindow):
             entries.append(TimestampEntry(seconds, label.strip()))
         return entries
 
-    def refresh_description_preview(self) -> None:
-        if not self.current_video:
+    def _set_timestamps_from_json(self, timestamps: list[dict[str, object]]) -> None:
+        lines = []
+        for timestamp in timestamps:
+            try:
+                seconds = float(timestamp.get("seconds", 0))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            label = str(timestamp.get("label", "")) if isinstance(timestamp, dict) else ""
+            line = f"{format_timestamp(seconds)} - {label}" if label else format_timestamp(seconds)
+            lines.append(line)
+        self.timestamp_editor.setPlainText("\n".join(lines))
+
+    def _top_tags_from_editor(self) -> list[str]:
+        return [token.strip() for token in self.tags_editor.text().split() if token.strip()]
+
+    def refresh_description_preview(self, *args) -> None:
+        del args
+        if self._loading_ui or not self.current_video:
             return
-        title = self.title_editor.text()
-        tags = top_tags_for_title(title, self.rule_mappings)
-        fields = self._parse_fields()
-        timestamps = self._parse_timestamp_editor()
-        description = render_description(self.template_text, fields, tags, timestamps)
-        self.description_editor.setPlainText(description)
+        template_name = self._selected_template_name()
+        description = render_description_template(
+            self.template_text,
+            template_name,
+            fields=self._current_fields(),
+            top_tags=self._top_tags_from_editor(),
+            timestamps=self._timestamps_from_editor(),
+            sections=self._sections_from_table(),
+        )
+        if self.description_editor.toPlainText() != description:
+            self.description_editor.setPlainText(description)
         self.refresh_diff()
 
     def refresh_diff(self) -> None:
@@ -279,6 +608,67 @@ class MainWindow(QMainWindow):
         after = self.description_editor.toPlainText().splitlines()
         diff = difflib.unified_diff(before, after, fromfile="현재 YouTube 설명", tofile="적용 예정 설명", lineterm="")
         self.diff_view.setPlainText("\n".join(diff))
+
+    def _draft_from_ui(self, status: str | None = None) -> Optional[DescriptionDraftRecord]:
+        if not self.current_video:
+            return None
+        previous = self.current_description_draft
+        new_status = status or (previous.status if previous else DRAFT_STATUS_DRAFT)
+        reviewed_at = previous.reviewed_at if previous else None
+        if new_status == DRAFT_STATUS_REVIEWED and not reviewed_at:
+            reviewed_at = utc_now_iso()
+        if new_status == DRAFT_STATUS_DRAFT:
+            reviewed_at = None
+        sections = self._sections_from_table()
+        timestamps = self._timestamps_from_editor()
+        return DescriptionDraftRecord(
+            video_id=self.current_video.video_id,
+            template_name=self._selected_template_name(),
+            status=new_status,
+            fields=self._current_fields(),
+            sections=[section_to_json(section) for section in sections],
+            timestamps=[{"seconds": timestamp.seconds, "label": timestamp.label} for timestamp in timestamps],
+            top_tags=self._top_tags_from_editor(),
+            rendered_description=self.description_editor.toPlainText().strip(),
+            parse_confidence=previous.parse_confidence if previous else "manual",
+            warnings=previous.warnings if previous else [],
+            unmatched_lines=previous.unmatched_lines if previous else [],
+            reviewed_at=reviewed_at,
+            applied_at=previous.applied_at if previous else None,
+        )
+
+    def save_current_draft(self) -> None:
+        draft = self._draft_from_ui(DRAFT_STATUS_DRAFT)
+        if not draft:
+            return
+        self.db.save_description_draft(draft, preserve_reviewed=False)
+        self.current_description_draft = self.db.get_description_draft(draft.video_id)
+        if self.current_description_draft:
+            self._set_draft_status_label(self._draft_status_text(self.current_description_draft))
+        self._load_cached_videos()
+        self.statusBar().showMessage("초안을 저장했습니다.")
+
+    def mark_current_reviewed(self) -> None:
+        draft = self._draft_from_ui(DRAFT_STATUS_REVIEWED)
+        if not draft:
+            return
+        self.db.save_description_draft(draft, preserve_reviewed=False)
+        self.current_description_draft = self.db.get_description_draft(draft.video_id)
+        if self.current_description_draft:
+            self._set_draft_status_label(self._draft_status_text(self.current_description_draft))
+        self._load_cached_videos()
+        self.statusBar().showMessage("검수 완료로 표시했습니다.")
+
+    def unreview_current_draft(self) -> None:
+        draft = self._draft_from_ui(DRAFT_STATUS_DRAFT)
+        if not draft:
+            return
+        self.db.save_description_draft(draft, preserve_reviewed=False)
+        self.current_description_draft = self.db.get_description_draft(draft.video_id)
+        if self.current_description_draft:
+            self._set_draft_status_label(self._draft_status_text(self.current_description_draft))
+        self._load_cached_videos()
+        self.statusBar().showMessage("검수 완료 상태를 해제했습니다.")
 
     def add_current_timestamp(self) -> None:
         if not self.current_video:
@@ -291,7 +681,6 @@ class MainWindow(QMainWindow):
             seconds = float(value or 0)
         except (TypeError, ValueError):
             seconds = 0
-        from ytmanager.timestamps import format_timestamp
         existing = self.timestamp_editor.toPlainText().rstrip()
         line = f"{format_timestamp(seconds)} - "
         self.timestamp_editor.setPlainText(f"{existing}\n{line}".lstrip())
@@ -338,49 +727,86 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "업로드 실패", f"썸네일 업로드 중 오류가 발생했습니다.\n\n{exc}")
 
-    def apply_changes(self) -> None:
-        if not self.current_video:
-            QMessageBox.information(self, "영상 선택 필요", "먼저 영상을 선택하세요.")
+    def apply_selected_draft(self) -> None:
+        if not self.current_video or not self.current_description_draft:
+            QMessageBox.information(self, "적용 대상 없음", "먼저 검수 완료된 영상을 선택하세요.")
             return
-        title = self.title_editor.text().strip()
-        description = self.description_editor.toPlainText().strip()
-        # 현재 MVP의 자동 태그는 설명 상단 해시태그를 뜻한다.
-        # YouTube snippet.tags는 별도 관리 UI가 생기기 전까지 기존 값을 보존한다.
-        tags = list(self.current_video.tags)
-        if not title:
-            QMessageBox.warning(self, "제목 필요", "제목은 비워둘 수 없습니다.")
+        draft = self._draft_from_ui(self.current_description_draft.status)
+        if draft:
+            self.db.save_description_draft(draft, preserve_reviewed=False)
+            self.current_description_draft = self.db.get_description_draft(draft.video_id)
+        if not self.current_description_draft or self.current_description_draft.status != DRAFT_STATUS_REVIEWED:
+            QMessageBox.warning(self, "검수 필요", "선택 적용은 검수 완료 상태의 영상만 가능합니다.")
+            return
+        self._apply_pairs([(self.current_video, self.current_description_draft)])
+
+    def apply_reviewed_drafts(self) -> None:
+        pairs = self.db.list_apply_ready_drafts()
+        if not pairs:
+            QMessageBox.information(self, "적용 대상 없음", "검수 완료이면서 변경된 초안이 없습니다.")
             return
         answer = QMessageBox.question(
             self,
-            "YouTube에 적용",
-            "현재 미리보기의 제목/설명/태그를 YouTube에 적용합니다. 적용 전 기존 값은 로컬 스냅샷으로 저장됩니다. 계속할까요?",
+            "일괄 적용 확인",
+            f"검수 완료된 변경분 {len(pairs)}개를 YouTube에 적용합니다. 계속할까요?",
         )
         if answer != QMessageBox.Yes:
             return
+        self._apply_pairs(pairs)
+
+    def _apply_pairs(self, pairs: list[tuple[VideoSummary, DescriptionDraftRecord]]) -> None:
         try:
             if not self.youtube:
                 service = self.oauth.build_youtube_service(write_access=True)
                 self.youtube = YouTubeApiClient(service)
-            self.db.save_snapshot(self.current_video)
-            self.youtube.update_video_snippet(self.current_video.video_id, title, description, tags)
-            updated = VideoSummary(
-                video_id=self.current_video.video_id,
-                title=title,
-                description=description,
-                tags=tuple(tags),
-                thumbnail_url=self.current_video.thumbnail_url,
-                duration=self.current_video.duration,
-                privacy_status=self.current_video.privacy_status,
-                published_at=self.current_video.published_at,
-                category_id=self.current_video.category_id,
-            )
-            self.db.save_videos([updated])
-            self.current_video = updated
-            QMessageBox.information(self, "적용 완료", "YouTube 메타데이터를 업데이트했습니다.")
+            success = 0
+            failed = 0
+            for video, draft in pairs:
+                try:
+                    self.db.save_snapshot(video)
+                    self.youtube.update_video_snippet(video.video_id, video.title, draft.rendered_description, list(video.tags))
+                    updated = VideoSummary(
+                        video_id=video.video_id,
+                        title=video.title,
+                        description=draft.rendered_description,
+                        tags=video.tags,
+                        thumbnail_url=video.thumbnail_url,
+                        duration=video.duration,
+                        privacy_status=video.privacy_status,
+                        published_at=video.published_at,
+                        category_id=video.category_id,
+                        width_pixels=video.width_pixels,
+                        height_pixels=video.height_pixels,
+                        display_aspect_ratio=video.display_aspect_ratio,
+                    )
+                    self.db.save_videos([updated])
+                    self.db.mark_draft_status(video.video_id, DRAFT_STATUS_APPLIED)
+                    success += 1
+                except Exception as exc:  # 개별 실패는 기록 후 계속한다.
+                    self.db.mark_draft_status(video.video_id, DRAFT_STATUS_ERROR, str(exc))
+                    failed += 1
             self._load_cached_videos()
+            QMessageBox.information(self, "적용 완료", f"성공 {success}개, 실패 {failed}개")
         except Exception as exc:
-            QMessageBox.critical(self, "적용 실패", f"YouTube 업데이트 중 오류가 발생했습니다.\n\n{exc}")
+            QMessageBox.critical(self, "적용 실패", f"YouTube 업데이트 준비 중 오류가 발생했습니다.\n\n{exc}")
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.db.close()
         super().closeEvent(event)
+
+
+def candidate_to_record(candidate) -> DescriptionDraftRecord:
+
+    return candidate_to_draft_record(candidate)
+
+
+def section_to_json(section: DescriptionSection) -> dict[str, object]:
+    return {
+        "stage_number": section.stage_number,
+        "boss_name": section.boss_name,
+        "party_composition": section.party_composition,
+        "party": [
+            {"character": member.character, "m_level": member.m_level, "equip": member.equip}
+            for member in section.party
+        ],
+    }

@@ -19,6 +19,12 @@ dist/
 htmlcov/
 pip-wheel-metadata/
 
+# OMC tool state
+.omc/
+
+# Temporary planning files
+plan.txt
+
 # Local app/runtime state
 .omx/
 .local/
