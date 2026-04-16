@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
+from ytmanager.character_master import CharacterMasterEntry, load_character_master_entries
 from ytmanager.character_status import UNKNOWN_RANK_VALUE, extract_video_date, game_key_from_title_prefix
 from ytmanager.models import VideoSummary
 from ytmanager.paths import default_database_path
@@ -71,6 +72,22 @@ CREATE TABLE IF NOT EXISTS character_aliases (
     source TEXT NOT NULL DEFAULT 'manual',
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (game_key, alias)
+);
+
+CREATE TABLE IF NOT EXISTS character_master (
+    game_key TEXT NOT NULL,
+    canonical_name_ko TEXT NOT NULL,
+    canonical_name_en TEXT NOT NULL DEFAULT '',
+    display_name TEXT NOT NULL DEFAULT '',
+    aliases_json TEXT NOT NULL DEFAULT '[]',
+    rarity TEXT NOT NULL DEFAULT '',
+    element TEXT NOT NULL DEFAULT '',
+    role_or_path TEXT NOT NULL DEFAULT '',
+    source_name TEXT NOT NULL DEFAULT 'manual',
+    source_url TEXT NOT NULL DEFAULT '',
+    extra_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (game_key, canonical_name_ko)
 );
 
 CREATE TABLE IF NOT EXISTS character_roster (
@@ -155,6 +172,22 @@ class CharacterRosterRecord:
     needs_alias_review: bool = True
 
 
+@dataclass(frozen=True)
+class CharacterMasterRecord:
+    game_key: str
+    canonical_name_ko: str
+    canonical_name_en: str = ""
+    display_name: str = ""
+    aliases_ko: list[str] = field(default_factory=list)
+    rarity: str = ""
+    element: str = ""
+    role_or_path: str = ""
+    source_name: str = "manual"
+    source_url: str = ""
+    extra: dict[str, object] = field(default_factory=dict)
+    updated_at: str = ""
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -172,6 +205,7 @@ class AppDatabase:
         self._ensure_video_columns()
         self._ensure_description_draft_columns()
         self._ensure_character_roster_columns()
+        self._ensure_character_master_columns()
         self.connection.commit()
 
     def _ensure_video_columns(self) -> None:
@@ -203,6 +237,16 @@ class AppDatabase:
         migrations = {
             "needs_alias_review": "ALTER TABLE character_roster ADD COLUMN needs_alias_review INTEGER NOT NULL DEFAULT 1",
             "source_title": "ALTER TABLE character_roster ADD COLUMN source_title TEXT NOT NULL DEFAULT ''",
+        }
+        for column, sql in migrations.items():
+            if column not in columns:
+                self.connection.execute(sql)
+
+    def _ensure_character_master_columns(self) -> None:
+        columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(character_master)").fetchall()}
+        migrations = {
+            "extra_json": "ALTER TABLE character_master ADD COLUMN extra_json TEXT NOT NULL DEFAULT '{}'",
+            "updated_at": "ALTER TABLE character_master ADD COLUMN updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
         }
         for column, sql in migrations.items():
             if column not in columns:
@@ -403,6 +447,63 @@ class AppDatabase:
                     """,
                     (game_key, alias, canonical_name, source, now),
                 )
+
+    def upsert_character_master(self, entry: CharacterMasterEntry, sync_aliases: bool = True) -> None:
+        entry.validate()
+        now = utc_now_iso()
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO character_master (
+                    game_key, canonical_name_ko, canonical_name_en, display_name,
+                    aliases_json, rarity, element, role_or_path, source_name,
+                    source_url, extra_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(game_key, canonical_name_ko) DO UPDATE SET
+                    canonical_name_en = excluded.canonical_name_en,
+                    display_name = excluded.display_name,
+                    aliases_json = excluded.aliases_json,
+                    rarity = excluded.rarity,
+                    element = excluded.element,
+                    role_or_path = excluded.role_or_path,
+                    source_name = excluded.source_name,
+                    source_url = excluded.source_url,
+                    extra_json = excluded.extra_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    entry.game_key,
+                    entry.canonical_name_ko,
+                    entry.canonical_name_en,
+                    entry.display_name or entry.canonical_name_ko,
+                    _json_dumps(list(entry.aliases_ko)),
+                    entry.rarity,
+                    entry.element,
+                    entry.role_or_path,
+                    entry.source_name,
+                    entry.source_url,
+                    _json_dumps(dict(entry.extra)),
+                    now,
+                ),
+            )
+        if sync_aliases:
+            self.upsert_character_alias(entry.game_key, entry.canonical_name_ko, entry.aliases_for_resolution, source=f"master:{entry.source_name}")
+
+    def load_character_master_from_file(self, path: Path, sync_aliases: bool = True) -> int:
+        entries = load_character_master_entries(path)
+        for entry in entries:
+            self.upsert_character_master(entry, sync_aliases=sync_aliases)
+        return len(entries)
+
+    def list_character_master(self, game_key: str | None = None) -> list[CharacterMasterRecord]:
+        if game_key:
+            rows = self.connection.execute(
+                "SELECT * FROM character_master WHERE game_key = ? ORDER BY canonical_name_ko",
+                (game_key,),
+            ).fetchall()
+        else:
+            rows = self.connection.execute("SELECT * FROM character_master ORDER BY game_key, canonical_name_ko").fetchall()
+        return [self._character_master_from_row(row) for row in rows]
 
     def load_character_aliases_from_file(self, path: Path) -> int:
         if not path.exists():
@@ -641,6 +742,22 @@ class AppDatabase:
             error_message=row["error_message"],
             reviewed_at=row["reviewed_at"],
             applied_at=row["applied_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def _character_master_from_row(self, row: sqlite3.Row) -> CharacterMasterRecord:
+        return CharacterMasterRecord(
+            game_key=row["game_key"],
+            canonical_name_ko=row["canonical_name_ko"],
+            canonical_name_en=row["canonical_name_en"],
+            display_name=row["display_name"],
+            aliases_ko=_json_loads(row["aliases_json"], []),
+            rarity=row["rarity"],
+            element=row["element"],
+            role_or_path=row["role_or_path"],
+            source_name=row["source_name"],
+            source_url=row["source_url"],
+            extra=_json_loads(row["extra_json"], {}),
             updated_at=row["updated_at"],
         )
 

@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "characters": [
+    {
+      "game_key": "honkai_starrail",
+      "canonical_name_ko": "카스토리스",
+      "canonical_name_en": "Castorice",
+      "display_name": "카스토리스",
+      "aliases_ko": ["카스", "김곰팡"],
+      "rarity": "5",
+      "element": "양자",
+      "role_or_path": "기억",
+      "source_name": "manual",
+      "source_url": "",
+      "extra": {}
+    },
+    {
+      "game_key": "zenless_zone_zero",
+      "canonical_name_ko": "시시아",
+      "canonical_name_en": "",
+      "display_name": "시시아",
+      "aliases_ko": ["뱀댕이"],
+      "rarity": "S",
+      "element": "전기",
+      "role_or_path": "강공",
+      "source_name": "manual",
+      "source_url": "",
+      "extra": {}
+    }
+  ]
+}
