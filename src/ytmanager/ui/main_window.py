@@ -26,9 +26,9 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QStatusBar,
-    QTableWidget,
-    QTableWidgetItem,
     QToolBar,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -36,10 +36,10 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from ytmanager.description import (
     DescriptionSection,
+    PartyMember,
     extract_placeholders,
     load_template,
     load_template_library,
-    parse_party_members,
     render_description_template,
     select_template,
 )
@@ -291,12 +291,20 @@ class MainWindow(QMainWindow):
         right_splitter = QSplitter(Qt.Vertical)
         right_layout.addWidget(right_splitter, stretch=1)
 
-        # 상단: 템플릿 필드 (스크롤) + 섹션 테이블 (combat)
+        # 상단: 템플릿 필드(스크롤) / 섹션 트리(combat) — 수직 스플리터로 비율 조절 가능
         meta_panel = QWidget()
         meta_layout = QVBoxLayout(meta_panel)
         meta_layout.setContentsMargins(0, 4, 0, 0)
         meta_layout.setSpacing(4)
-        meta_layout.addWidget(QLabel("템플릿 필드"))
+
+        meta_splitter = QSplitter(Qt.Vertical)
+
+        # 필드 영역
+        field_widget = QWidget()
+        field_vlayout = QVBoxLayout(field_widget)
+        field_vlayout.setContentsMargins(0, 0, 0, 0)
+        field_vlayout.setSpacing(2)
+        field_vlayout.addWidget(QLabel("템플릿 필드"))
         self.field_form_container = QWidget()
         self.field_form = QFormLayout(self.field_form_container)
         self.field_form.setContentsMargins(0, 0, 0, 0)
@@ -304,31 +312,40 @@ class MainWindow(QMainWindow):
         field_scroll.setWidget(self.field_form_container)
         field_scroll.setWidgetResizable(True)
         field_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        field_scroll.setMaximumHeight(220)
-        meta_layout.addWidget(field_scroll)
+        field_vlayout.addWidget(field_scroll, stretch=1)
+        meta_splitter.addWidget(field_widget)
 
+        # 섹션/파티원 트리 영역 (QTreeWidget: 섹션 > 파티원 2단계 계층)
         self.section_panel = QWidget()
         section_layout = QVBoxLayout(self.section_panel)
         section_layout.setContentsMargins(0, 0, 0, 0)
         section_layout.setSpacing(4)
         section_header = QHBoxLayout()
-        section_header.addWidget(QLabel("섹션/파티원"))
+        section_header.addWidget(QLabel("섹션 / 파티원"))
         add_section_btn = QPushButton("섹션 추가")
         add_section_btn.clicked.connect(self.add_section_row)
-        remove_section_btn = QPushButton("선택 섹션 삭제")
-        remove_section_btn.clicked.connect(self.remove_selected_section_rows)
+        add_member_btn = QPushButton("파티원 추가")
+        add_member_btn.clicked.connect(self.add_party_member_row)
+        remove_btn = QPushButton("선택 삭제")
+        remove_btn.clicked.connect(self.remove_selected_section_rows)
         section_header.addWidget(add_section_btn)
-        section_header.addWidget(remove_section_btn)
+        section_header.addWidget(add_member_btn)
+        section_header.addWidget(remove_btn)
         section_layout.addLayout(section_header)
-        self.section_table = QTableWidget(0, 4)
-        self.section_table.setHorizontalHeaderLabels(["단계", "보스/제목", "파티/구성", "파티원(이름|상태|장비)"])
-        self.section_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.section_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.section_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.section_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.section_table.itemChanged.connect(self.refresh_description_preview)
-        section_layout.addWidget(self.section_table, stretch=1)
-        meta_layout.addWidget(self.section_panel, stretch=1)
+        self.section_tree = QTreeWidget()
+        self.section_tree.setColumnCount(4)
+        self.section_tree.setHeaderLabels(["단계", "보스 / 캐릭터", "파티 구성 / 돌파", "장비"])
+        self.section_tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.section_tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.section_tree.header().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.section_tree.header().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.section_tree.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
+        self.section_tree.itemChanged.connect(self.refresh_description_preview)
+        section_layout.addWidget(self.section_tree, stretch=1)
+        meta_splitter.addWidget(self.section_panel)
+        meta_splitter.setSizes([160, 240])
+
+        meta_layout.addWidget(meta_splitter, stretch=1)
         right_splitter.addWidget(meta_panel)
 
         # 하단: 설명 미리보기 + diff + 액션 버튼
@@ -463,7 +480,7 @@ class MainWindow(QMainWindow):
         self._loading_ui = True
         self.current_description_draft = draft
         self.title_editor.setText(video.title)
-        self.section_table.setRowCount(0)
+        self.section_tree.clear()
         self.timestamp_editor.setPlainText("")
         if draft is None:
             self._set_template_name("combat")
@@ -542,58 +559,87 @@ class MainWindow(QMainWindow):
         return {name: edit.text().strip() for name, edit in self.field_edits.items() if edit.text().strip()}
 
     def add_section_row(self) -> None:
-        row = self.section_table.rowCount()
-        self.section_table.insertRow(row)
-        for column in range(self.section_table.columnCount()):
-            self.section_table.setItem(row, column, QTableWidgetItem(""))
-
-    def remove_selected_section_rows(self) -> None:
-        rows = sorted({index.row() for index in self.section_table.selectedIndexes()}, reverse=True)
-        for row in rows:
-            self.section_table.removeRow(row)
+        item = QTreeWidgetItem(self.section_tree, ["", "", "", ""])
+        item.setFlags(item.flags() | Qt.ItemIsEditable)
+        item.setExpanded(True)
+        self.section_tree.setCurrentItem(item)
         self.refresh_description_preview()
 
-    def _sections_from_table(self) -> list[DescriptionSection]:
+    def add_party_member_row(self) -> None:
+        current = self.section_tree.currentItem()
+        if current is None:
+            count = self.section_tree.topLevelItemCount()
+            if count == 0:
+                return
+            parent = self.section_tree.topLevelItem(count - 1)
+        elif current.parent() is None:
+            parent = current
+        else:
+            parent = current.parent()
+        member = QTreeWidgetItem(parent, ["", "", "", ""])
+        member.setFlags(member.flags() | Qt.ItemIsEditable)
+        parent.setExpanded(True)
+        self.section_tree.setCurrentItem(member)
+        self.refresh_description_preview()
+
+    def remove_selected_section_rows(self) -> None:
+        for item in list(self.section_tree.selectedItems()):
+            parent = item.parent()
+            if parent is None:
+                idx = self.section_tree.indexOfTopLevelItem(item)
+                self.section_tree.takeTopLevelItem(idx)
+            else:
+                parent.removeChild(item)
+        self.refresh_description_preview()
+
+    def _sections_from_tree(self) -> list[DescriptionSection]:
         sections: list[DescriptionSection] = []
-        for row in range(self.section_table.rowCount()):
-            values = [self._table_text(row, column) for column in range(4)]
-            if not any(values):
-                continue
-            sections.append(
-                DescriptionSection(
-                    stage_number=values[0],
-                    boss_name=values[1],
-                    party_composition=values[2],
-                    party=parse_party_members(values[3]),
-                )
-            )
+        for i in range(self.section_tree.topLevelItemCount()):
+            sec = self.section_tree.topLevelItem(i)
+            stage_number = sec.text(0).strip()
+            boss_name = sec.text(1).strip()
+            party_composition = sec.text(2).strip()
+            party: list[PartyMember] = []
+            for j in range(sec.childCount()):
+                mem = sec.child(j)
+                character = mem.text(1).strip()
+                m_level = mem.text(2).strip()
+                equip = mem.text(3).strip()
+                if character:
+                    party.append(PartyMember(character, m_level, equip))
+            if boss_name or stage_number:
+                sections.append(DescriptionSection(
+                    stage_number=stage_number,
+                    boss_name=boss_name,
+                    party_composition=party_composition,
+                    party=tuple(party),
+                ))
         return sections
 
-    def _table_text(self, row: int, column: int) -> str:
-        item = self.section_table.item(row, column)
-        return item.text().strip() if item else ""
-
     def _set_sections_from_json(self, sections: list[dict[str, object]]) -> None:
-        self.section_table.blockSignals(True)
-        self.section_table.setRowCount(0)
+        self.section_tree.blockSignals(True)
+        self.section_tree.clear()
         for section in sections:
-            row = self.section_table.rowCount()
-            self.section_table.insertRow(row)
-            party = section.get("party", []) if isinstance(section, dict) else []
-            party_lines = []
+            if not isinstance(section, dict):
+                continue
+            stage_number = str(section.get("stage_number", ""))
+            boss_name = str(section.get("boss_name", ""))
+            party_composition = str(section.get("party_composition", ""))
+            sec_item = QTreeWidgetItem(self.section_tree, [stage_number, boss_name, party_composition, ""])
+            sec_item.setFlags(sec_item.flags() | Qt.ItemIsEditable)
+            party = section.get("party", [])
             if isinstance(party, list):
                 for member in party:
                     if isinstance(member, dict):
-                        party_lines.append("|".join(str(member.get(key, "")) for key in ("character", "m_level", "equip")))
-            values = [
-                str(section.get("stage_number", "")),
-                str(section.get("boss_name", "")),
-                str(section.get("party_composition", "")),
-                "\n".join(party_lines),
-            ]
-            for column, value in enumerate(values):
-                self.section_table.setItem(row, column, QTableWidgetItem(value))
-        self.section_table.blockSignals(False)
+                        mem_item = QTreeWidgetItem(sec_item, [
+                            "",
+                            str(member.get("character", "")),
+                            str(member.get("m_level", "")),
+                            str(member.get("equip", "")),
+                        ])
+                        mem_item.setFlags(mem_item.flags() | Qt.ItemIsEditable)
+            sec_item.setExpanded(True)
+        self.section_tree.blockSignals(False)
 
     def _timestamps_from_editor(self) -> list[TimestampEntry]:
         entries: list[TimestampEntry] = []
@@ -634,7 +680,7 @@ class MainWindow(QMainWindow):
             fields=self._current_fields(),
             top_tags=self._top_tags_from_editor(),
             timestamps=self._timestamps_from_editor(),
-            sections=self._sections_from_table(),
+            sections=self._sections_from_tree(),
         )
         if self.description_editor.toPlainText() != description:
             self.description_editor.setPlainText(description)
@@ -659,7 +705,7 @@ class MainWindow(QMainWindow):
             reviewed_at = utc_now_iso()
         if new_status == DRAFT_STATUS_DRAFT:
             reviewed_at = None
-        sections = self._sections_from_table()
+        sections = self._sections_from_tree()
         timestamps = self._timestamps_from_editor()
         return DescriptionDraftRecord(
             video_id=self.current_video.video_id,
