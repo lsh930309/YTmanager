@@ -9,6 +9,7 @@ from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
+    QCompleter,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -589,6 +590,36 @@ class MainWindow(QMainWindow):
         member.setFlags(member.flags() | Qt.ItemIsEditable)
         parent.setExpanded(True)
         self.section_tree.setCurrentItem(member)
+        self._attach_character_completer(member)
+        self.refresh_description_preview()
+
+    def _character_completion_values(self) -> list[str]:
+        if not self.current_video:
+            return []
+        game_key = game_key_from_title_prefix(extract_title_prefix(self.current_video.title))
+        values: list[str] = []
+        for suggestion in self.db.character_suggestions(game_key, limit=500):
+            label = suggestion.display_name
+            if suggestion.owned_status:
+                label = f"{label} ({suggestion.owned_status})"
+            values.append(label)
+            values.extend(suggestion.aliases)
+        return sorted(dict.fromkeys(value for value in values if value))
+
+    def _attach_character_completer(self, item: QTreeWidgetItem) -> None:
+        editor = QLineEdit()
+        editor.setText(item.text(1))
+        completer = QCompleter(self._character_completion_values(), editor)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        editor.setCompleter(completer)
+        editor.editingFinished.connect(lambda: self._commit_character_editor(item, editor))
+        self.section_tree.setItemWidget(item, 1, editor)
+
+    def _commit_character_editor(self, item: QTreeWidgetItem, editor: QLineEdit) -> None:
+        value = editor.text().strip()
+        if " (" in value and value.endswith(")"):
+            value = value.rsplit(" (", 1)[0]
+        item.setText(1, value)
         self.refresh_description_preview()
 
     def remove_selected_section_rows(self) -> None:
@@ -664,6 +695,7 @@ class MainWindow(QMainWindow):
                             str(member.get("equip", "")),
                         ])
                         mem_item.setFlags(mem_item.flags() | Qt.ItemIsEditable)
+                        self._attach_character_completer(mem_item)
             sec_item.setExpanded(True)
         self.section_tree.blockSignals(False)
 

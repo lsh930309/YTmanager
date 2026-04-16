@@ -44,3 +44,30 @@
 - 외부 웹 수집 결과는 바로 기존 alias를 덮어쓰지 않고, 마스터 사전에 source를 남긴다.
 - 별칭은 `character_aliases`로 동기화하되, 같은 게임 내 alias 충돌은 나중에 GUI에서 검수한다.
 - 자동완성은 마스터 사전의 대표명과 alias를 우선 사용하고, 기존 역파싱 roster는 보유 상태 추천에 사용한다.
+
+## 현재 구현된 빌드 파이프라인
+
+- `scripts/update_character_master.py --list-sources`로 내장 소스 목록을 확인한다.
+- `scripts/build_character_master.py`는 기본 소스를 수집하고 `.local/master/` 아래에 소스별 JSON, 병합 JSON, 리포트를 생성한다.
+- `--apply`를 붙이면 병합 결과를 `character_master` DB에 import하고 `character_aliases`도 동기화한다.
+- 현재 내장 소스:
+  - `zzz_gg_ko`: ZZZ.GG 한국어 젠레스 존 제로 캐릭터 목록
+  - `hoyodb_hsr_ko`: HoYoDB/BitTopup Wiki 한국어 붕괴: 스타레일 목록
+  - `namu_hsr_ko`: 나무위키 한국어 붕괴: 스타레일 캐릭터 문서
+  - `namu_ww_ko`: 나무위키 한국어 명조 공명자 문서
+  - `endfield_wiki_en`: Arknights: Endfield Wiki 영어 오퍼레이터 목록
+
+### 권장 명령
+
+```bash
+.venv/bin/python scripts/build_character_master.py --output-dir .local/master
+.venv/bin/python scripts/build_character_master.py --output-dir .local/master --apply
+```
+
+### 현재 품질 메모
+
+- 젠레스 존 제로: 한국어명/역할/희귀도는 양호하나 일부 속성 누락이 있다.
+- 붕괴: 스타레일: 나무위키는 한국어 운명의 길이 좋고 HoYoDB는 속성 보강에 유용하다.
+- 명조: 나무위키에서 한국어명/속성은 확보되지만 희귀도와 무기/직군은 추가 소스가 필요하다.
+- 엔드필드: 영어 위키 기준으로 영어명/속성/직군/희귀도를 확보하며, 한국어명은 추후 보강이 필요하다.
+

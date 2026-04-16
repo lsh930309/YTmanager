@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ytmanager.character_master import CharacterMasterEntry, dump_character_master_entries
+from ytmanager.character_sources import SOURCE_CATALOG, collect_source
 from ytmanager.storage import AppDatabase
 
 
@@ -48,17 +49,29 @@ def extract_entries_from_regex(text: str, game_key: str, pattern: str, source_na
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="URL/정규식 기반 캐릭터 마스터 초안 수집기입니다.")
-    parser.add_argument("--game-key", required=True, help="예: zenless_zone_zero")
-    parser.add_argument("--url", required=True, help="공식 위키/나무위키 등 수집 대상 URL")
-    parser.add_argument("--name-regex", required=True, help="캐릭터명을 캡처하는 정규식. named group name 권장")
+    parser.add_argument("--list-sources", action="store_true", help="내장 소스 카탈로그를 출력합니다.")
+    parser.add_argument("--source", choices=sorted(SOURCE_CATALOG), help="내장 소스 키")
+    parser.add_argument("--game-key", help="예: zenless_zone_zero")
+    parser.add_argument("--url", help="공식 위키/나무위키 등 수집 대상 URL")
+    parser.add_argument("--name-regex", help="캐릭터명을 캡처하는 정규식. named group name 권장")
     parser.add_argument("--source-name", default="web", help="source_name 저장값")
     parser.add_argument("--output", type=Path, help="수집 결과 JSON 저장 경로")
     parser.add_argument("--database", type=Path, help="테스트/개발용 SQLite DB 경로")
     parser.add_argument("--apply", action="store_true", help="수집 결과를 DB에 저장합니다")
     args = parser.parse_args()
 
-    text = fetch_text(args.url)
-    entries = extract_entries_from_regex(text, args.game_key, args.name_regex, args.source_name, args.url)
+    if args.list_sources:
+        for key, source in SOURCE_CATALOG.items():
+            print(f"{key}: {source.description} ({source.url})")
+        return 0
+
+    if args.source:
+        entries = collect_source(args.source)
+    else:
+        if not args.game_key or not args.url or not args.name_regex:
+            parser.error("--source를 쓰지 않을 경우 --game-key, --url, --name-regex가 필요합니다.")
+        text = fetch_text(args.url)
+        entries = extract_entries_from_regex(text, args.game_key, args.name_regex, args.source_name, args.url)
     print(f"수집 후보: {len(entries)}")
     if args.output:
         dump_character_master_entries(entries, args.output)

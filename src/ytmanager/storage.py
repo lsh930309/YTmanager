@@ -188,6 +188,19 @@ class CharacterMasterRecord:
     updated_at: str = ""
 
 
+@dataclass(frozen=True)
+class CharacterSuggestion:
+    game_key: str
+    canonical_name: str
+    display_name: str
+    aliases: list[str] = field(default_factory=list)
+    rarity: str = ""
+    element: str = ""
+    role_or_path: str = ""
+    owned_status: str = ""
+    source: str = "master"
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -505,6 +518,57 @@ class AppDatabase:
             rows = self.connection.execute("SELECT * FROM character_master ORDER BY game_key, canonical_name_ko").fetchall()
         return [self._character_master_from_row(row) for row in rows]
 
+    def character_suggestions(self, game_key: str, query: str = "", limit: int = 50) -> list[CharacterSuggestion]:
+        normalized_query = query.strip().casefold()
+        master_rows = self.connection.execute(
+            "SELECT * FROM character_master WHERE game_key = ? ORDER BY canonical_name_ko",
+            (game_key,),
+        ).fetchall()
+        roster_rows = {
+            row["canonical_name"]: row
+            for row in self.connection.execute(
+                "SELECT * FROM character_roster WHERE game_key = ?",
+                (game_key,),
+            ).fetchall()
+        }
+        suggestions: list[CharacterSuggestion] = []
+        seen: set[str] = set()
+        for row in master_rows:
+            aliases = _json_loads(row["aliases_json"], [])
+            searchable = [row["canonical_name_ko"], row["canonical_name_en"], row["display_name"], *aliases]
+            if normalized_query and not any(normalized_query in str(value).casefold() for value in searchable):
+                continue
+            roster = roster_rows.get(row["canonical_name_ko"])
+            suggestions.append(
+                CharacterSuggestion(
+                    game_key=game_key,
+                    canonical_name=row["canonical_name_ko"],
+                    display_name=row["display_name"] or row["canonical_name_ko"],
+                    aliases=aliases,
+                    rarity=row["rarity"],
+                    element=row["element"],
+                    role_or_path=row["role_or_path"],
+                    owned_status=_owned_status_from_roster(roster) if roster else "",
+                    source="master",
+                )
+            )
+            seen.add(row["canonical_name_ko"])
+        for canonical_name, roster in roster_rows.items():
+            if canonical_name in seen:
+                continue
+            if normalized_query and normalized_query not in canonical_name.casefold():
+                continue
+            suggestions.append(
+                CharacterSuggestion(
+                    game_key=game_key,
+                    canonical_name=canonical_name,
+                    display_name=roster["display_name"] or canonical_name,
+                    owned_status=_owned_status_from_roster(roster),
+                    source="roster",
+                )
+            )
+        return suggestions[:limit]
+
     def load_character_aliases_from_file(self, path: Path) -> int:
         if not path.exists():
             return 0
@@ -778,3 +842,18 @@ def _safe_int(value: object, fallback: int = UNKNOWN_RANK_VALUE) -> int:
         return int(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def _owned_status_from_roster(row: sqlite3.Row | None) -> str:
+    if row is None:
+        return ""
+    character = row["character_rank_label"]
+    equipment_rank = row["equipment_rank_label"]
+    equipment_type = row["equipment_type"]
+    if not character and not equipment_rank and not equipment_type:
+        return ""
+    if character == "명함" and row["equipment_rank_value"] == 1:
+        return "명전"
+    if row["equipment_rank_value"] == 1:
+        return f"{character}{equipment_type}" if character else equipment_type
+    return f"{character}{equipment_rank}" if character else equipment_rank
