@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QThread, Signal
 from PySide6.QtWidgets import (

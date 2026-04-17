@@ -4,12 +4,13 @@ import difflib
 from pathlib import Path
 from typing import Callable, Optional
 
-from PySide6.QtCore import QTimer, QUrl, Qt
-from PySide6.QtGui import QColor, QDesktopServices, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QEvent, QThread, QTimer, QUrl, Qt, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
     QCompleter,
+    QDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -63,6 +64,7 @@ from ytmanager.storage import (
     utc_now_iso,
 )
 from ytmanager.thumbnail import public_thumbnail_url, public_watch_url, validate_thumbnail_file
+from ytmanager.thumbnail_upscale import UpscaleResult, prepare_waifu2x_binary, upscale_thumbnail_candidate, waifu2x_status
 from ytmanager.timestamps import format_timestamp, parse_timestamp
 from ytmanager.youtube_api import YouTubeApiClient, YouTubeApiError
 
@@ -72,6 +74,7 @@ THUMBNAIL_PREVIEW_WIDTH = 256
 THUMBNAIL_PREVIEW_HEIGHT = 144
 THUMBNAIL_EXPORT_WIDTH = 1280
 THUMBNAIL_EXPORT_HEIGHT = 720
+THUMBNAIL_UPSCALE_MODE = "waifu2x"
 DEFAULT_FRAME_STEP_FPS = 30
 KEYBOARD_SEEK_SECONDS = 5
 BLACK_BORDER_THRESHOLD = 18
@@ -253,6 +256,138 @@ class FixedVideoFrame(QWidget):
         self.mouse_shield.raise_()
 
 
+class ThumbnailPreviewDialog(QDialog):
+    """썸네일 후보를 크게 보여주는 클릭-닫기 뷰어."""
+
+    def __init__(self, image_path: Optional[Path], fallback_pixmap: Optional[QPixmap], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("썸네일 후보 미리보기")
+        self.setStyleSheet("background-color: #050505; color: #ddd;")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        pixmap = QPixmap(str(image_path)) if image_path and image_path.exists() else QPixmap()
+        if pixmap.isNull() and fallback_pixmap is not None:
+            pixmap = QPixmap(fallback_pixmap)
+        if not pixmap.isNull():
+            pixmap.setDevicePixelRatio(1.0)
+
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setStyleSheet("background-color: #050505;")
+        self.image_label.installEventFilter(self)
+        layout.addWidget(self.image_label)
+
+        hint = QLabel("클릭 또는 Esc로 닫기")
+        hint.setAlignment(Qt.AlignCenter)
+        hint.installEventFilter(self)
+        layout.addWidget(hint)
+
+        self._set_display_pixmap(pixmap)
+
+    def _set_display_pixmap(self, pixmap: QPixmap) -> None:
+        if pixmap.isNull():
+            self.image_label.setText("표시할 썸네일 후보가 없습니다.")
+            self.resize(480, 240)
+            return
+        available = (self.screen() or QGuiApplication.primaryScreen()).availableGeometry()
+        max_width = max(320, int(available.width() * 0.82))
+        max_height = max(240, int(available.height() * 0.82) - 48)
+        scale = min(max_width / pixmap.width(), max_height / pixmap.height(), 2.0)
+        scale = max(0.1, scale)
+        display = pixmap.scaled(
+            max(1, int(pixmap.width() * scale)),
+            max(1, int(pixmap.height() * scale)),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        display.setDevicePixelRatio(1.0)
+        self.image_label.setPixmap(display)
+        self.resize(display.width() + 24, display.height() + 64)
+
+    def eventFilter(self, watched: object, event: object) -> bool:  # type: ignore[override]
+        if event.type() == QEvent.Type.MouseButtonPress:  # type: ignore[attr-defined]
+            self.close()
+            return True
+        return super().eventFilter(watched, event)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        event.accept()
+        self.close()
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() == Qt.Key_Escape:
+            event.accept()
+            self.close()
+            return
+        super().keyPressEvent(event)
+
+
+class ThumbnailPreviewLabel(QLabel):
+    """클릭하면 현재 썸네일 후보를 크게 여는 QLabel."""
+
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self.candidate_path: Optional[Path] = None
+        self.candidate_pixmap: Optional[QPixmap] = None
+        self.viewer: Optional[ThumbnailPreviewDialog] = None
+        self.setToolTip("캡처한 썸네일 후보가 없습니다.")
+
+    def set_candidate(self, path: Path, pixmap: QPixmap) -> None:
+        self.candidate_path = path
+        self.candidate_pixmap = QPixmap(pixmap)
+        self.setToolTip("클릭하면 크게 보기")
+        self.setCursor(Qt.PointingHandCursor)
+
+    def clear_candidate(self) -> None:
+        self.candidate_path = None
+        self.candidate_pixmap = None
+        self.viewer = None
+        self.unsetCursor()
+        self.setToolTip("캡처한 썸네일 후보가 없습니다.")
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if self.candidate_path or self.candidate_pixmap:
+            event.accept()
+            self.viewer = ThumbnailPreviewDialog(self.candidate_path, self.candidate_pixmap, self.window())
+            self.viewer.show()
+            self.viewer.raise_()
+            self.viewer.activateWindow()
+            return
+        super().mousePressEvent(event)
+
+
+class ThumbnailUpscaleWorker(QThread):
+    finished_result = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, input_path: Path, output_path: Path, mode: str = THUMBNAIL_UPSCALE_MODE) -> None:
+        super().__init__()
+        self.input_path = input_path
+        self.output_path = output_path
+        self.mode = mode
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            result = upscale_thumbnail_candidate(self.input_path, self.output_path, mode=self.mode)
+            self.finished_result.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class Waifu2xInstallWorker(QThread):
+    finished_result = Signal(object)
+    failed = Signal(str)
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            executable = prepare_waifu2x_binary()
+            self.finished_result.emit(executable)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -267,6 +402,8 @@ class MainWindow(QMainWindow):
         self.current_draft: Optional[VideoDraft] = None
         self.current_description_draft: Optional[DescriptionDraftRecord] = None
         self.last_thumbnail_candidate: Optional[Path] = None
+        self.thumbnail_upscale_worker: Optional[ThumbnailUpscaleWorker] = None
+        self.waifu2x_install_worker: Optional[Waifu2xInstallWorker] = None
         self.template_text = load_template()
         self.template_library = load_template_library(self.template_text)
         self.rule_mappings = load_rule_mappings()
@@ -382,10 +519,10 @@ class MainWindow(QMainWindow):
         timestamp_btn = QPushButton("현재 시점을 타임스탬프로 추가")
         timestamp_btn.setToolTip("현재 재생 위치를 설명 타임스탬프에 추가")
         timestamp_btn.clicked.connect(self.add_current_timestamp)
-        capture_btn = QPushButton("📸")
-        capture_btn.setToolTip("현재 화면을 썸네일 후보로 캡처")
-        capture_btn.clicked.connect(self.capture_thumbnail_candidate)
-        for button in (seek_back_btn, frame_back_btn, self.play_pause_btn, frame_forward_btn, seek_forward_btn, capture_btn):
+        self.capture_thumbnail_btn = QPushButton("📸")
+        self.capture_thumbnail_btn.setToolTip("현재 화면을 썸네일 후보로 캡처")
+        self.capture_thumbnail_btn.clicked.connect(self.capture_thumbnail_candidate)
+        for button in (seek_back_btn, frame_back_btn, self.play_pause_btn, frame_forward_btn, seek_forward_btn, self.capture_thumbnail_btn):
             button.setFixedWidth(34)
         player_buttons.addWidget(seek_back_btn)
         player_buttons.addWidget(frame_back_btn)
@@ -394,7 +531,7 @@ class MainWindow(QMainWindow):
         player_buttons.addWidget(seek_forward_btn)
         player_buttons.addWidget(self.player_time_label)
         player_buttons.addWidget(timestamp_btn)
-        player_buttons.addWidget(capture_btn)
+        player_buttons.addWidget(self.capture_thumbnail_btn)
         player_buttons.addStretch(1)
         player_layout.addLayout(player_buttons)
 
@@ -402,7 +539,7 @@ class MainWindow(QMainWindow):
         thumbnail_layout = QHBoxLayout(thumbnail_group)
         thumbnail_layout.setContentsMargins(8, 8, 8, 8)
         thumbnail_layout.setSpacing(10)
-        self.thumbnail_preview = QLabel("캡처한 썸네일 후보가 여기에 표시됩니다.")
+        self.thumbnail_preview = ThumbnailPreviewLabel("캡처한 썸네일 후보가 여기에 표시됩니다.")
         self.thumbnail_preview.setFixedSize(THUMBNAIL_PREVIEW_WIDTH, THUMBNAIL_PREVIEW_HEIGHT)
         self.thumbnail_preview.setAlignment(Qt.AlignCenter)
         self.thumbnail_preview.setStyleSheet("background-color: #111; color: #aaa; border: 1px solid #333;")
@@ -418,9 +555,12 @@ class MainWindow(QMainWindow):
         self.open_watch_page_btn = QPushButton("영상 페이지 열기")
         self.open_watch_page_btn.clicked.connect(self._open_video_watch_page)
         self.open_watch_page_btn.setEnabled(False)
+        self.waifu2x_status_btn = QPushButton("waifu2x 확인")
+        self.waifu2x_status_btn.clicked.connect(self.check_waifu2x_installation)
         thumbnail_actions.addWidget(self.upload_thumbnail_btn)
         thumbnail_actions.addWidget(self.open_thumbnail_preview_btn)
         thumbnail_actions.addWidget(self.open_watch_page_btn)
+        thumbnail_actions.addWidget(self.waifu2x_status_btn)
         thumbnail_actions.addStretch(1)
         thumbnail_side = QVBoxLayout()
         thumbnail_side.addWidget(self.thumbnail_candidate_label)
@@ -673,11 +813,25 @@ class MainWindow(QMainWindow):
     def _reset_thumbnail_candidate(self) -> None:
         self.last_thumbnail_candidate = None
         self.thumbnail_preview.clear()
+        self.thumbnail_preview.clear_candidate()
         self.thumbnail_preview.setText("캡처한 썸네일 후보가 여기에 표시됩니다.")
         self.thumbnail_candidate_label.setText("후보 없음")
+        if hasattr(self, "capture_thumbnail_btn"):
+            self.capture_thumbnail_btn.setEnabled(bool(self.current_video))
         self.upload_thumbnail_btn.setEnabled(False)
         self.open_thumbnail_preview_btn.setEnabled(bool(self.current_video))
         self.open_watch_page_btn.setEnabled(bool(self.current_video))
+
+    def _set_thumbnail_processing(self, processing: bool) -> None:
+        if hasattr(self, "capture_thumbnail_btn"):
+            self.capture_thumbnail_btn.setEnabled(not processing and bool(self.current_video))
+        self.upload_thumbnail_btn.setEnabled(not processing and bool(self.last_thumbnail_candidate))
+        if processing:
+            self.open_thumbnail_preview_btn.setEnabled(False)
+            self.open_watch_page_btn.setEnabled(False)
+        else:
+            self.open_thumbnail_preview_btn.setEnabled(bool(self.current_video))
+            self.open_watch_page_btn.setEnabled(bool(self.current_video))
 
     def _load_draft_into_ui(self, video: VideoSummary, draft: DescriptionDraftRecord | None) -> None:
         self._loading_ui = True
@@ -1120,17 +1274,99 @@ class MainWindow(QMainWindow):
     def _do_capture_thumbnail(self) -> None:
         if not self.current_video:
             return
-        target = user_cache_dir() / f"thumbnail-{self.current_video.video_id}.jpg"
-        pixmap = self._resize_thumbnail_candidate(self._trim_black_borders(self.player.grab()))
-        if not pixmap.save(str(target), "JPG", 92):
-            QMessageBox.warning(self, "캡처 실패", "현재 재생 화면을 이미지로 저장하지 못했습니다.")
+        cache_dir = user_cache_dir()
+        raw_target = cache_dir / f"thumbnail-{self.current_video.video_id}-raw.png"
+        final_target = cache_dir / f"thumbnail-{self.current_video.video_id}.jpg"
+        pixmap = self._trim_black_borders(self.player.grab())
+        if not pixmap.save(str(raw_target), "PNG"):
+            QMessageBox.warning(self, "캡처 실패", "현재 재생 화면을 원본 후보 이미지로 저장하지 못했습니다.")
             return
-        validation = validate_thumbnail_file(target)
+        if self.thumbnail_upscale_worker and self.thumbnail_upscale_worker.isRunning():
+            QMessageBox.information(self, "처리 중", "이미 썸네일 업스케일 처리가 진행 중입니다.")
+            return
+        self.thumbnail_candidate_label.setText("썸네일 후보 복원/업스케일 중...")
+        self.statusBar().showMessage("썸네일 후보 복원/업스케일 중... 최초 실행 시 waifu2x를 다운로드할 수 있습니다.")
+        self._set_thumbnail_processing(True)
+        worker = ThumbnailUpscaleWorker(raw_target, final_target)
+        self.thumbnail_upscale_worker = worker
+        worker.finished_result.connect(self._on_thumbnail_upscale_finished)
+        worker.failed.connect(self._on_thumbnail_upscale_failed)
+        worker.finished.connect(self._on_thumbnail_upscale_worker_finished)
+        worker.start()
+
+    def _on_thumbnail_upscale_finished(self, result: object) -> None:
+        if not isinstance(result, UpscaleResult):
+            self._on_thumbnail_upscale_failed("업스케일 결과 형식이 올바르지 않습니다.")
+            return
+        pixmap = QPixmap(str(result.output_path))
+        if pixmap.isNull():
+            self._on_thumbnail_upscale_failed("업스케일된 썸네일 후보 이미지를 열 수 없습니다.")
+            return
+        validation = validate_thumbnail_file(result.output_path)
         if not validation.can_upload:
             QMessageBox.warning(self, "썸네일 검증 실패", validation.message)
+            self.statusBar().showMessage(f"썸네일 검증 실패: {validation.message}")
+            self._set_thumbnail_processing(False)
             return
-        self._set_thumbnail_candidate(target, pixmap)
-        self.statusBar().showMessage(f"썸네일 후보 저장 완료: {target}")
+        self._set_thumbnail_candidate(result.output_path, pixmap, result.message)
+        fallback_note = " (fallback)" if result.fallback_used else ""
+        self.statusBar().showMessage(f"썸네일 후보 저장 완료{fallback_note}: {result.output_path}")
+        self._set_thumbnail_processing(False)
+
+    def _on_thumbnail_upscale_failed(self, message: str) -> None:
+        QMessageBox.warning(self, "업스케일 실패", f"썸네일 후보 업스케일 중 오류가 발생했습니다.\n\n{message}")
+        self.thumbnail_candidate_label.setText(f"업스케일 실패: {message}")
+        self.statusBar().showMessage(f"업스케일 실패: {message}")
+        self._set_thumbnail_processing(False)
+
+    def _on_thumbnail_upscale_worker_finished(self) -> None:
+        self.thumbnail_upscale_worker = None
+
+    def check_waifu2x_installation(self) -> None:
+        status = waifu2x_status()
+        if status.available:
+            QMessageBox.information(
+                self,
+                "waifu2x 준비 완료",
+                f"{status.message}\n\n플랫폼: {status.platform_key}\n캐시: {status.cache_dir}",
+            )
+            self.statusBar().showMessage(status.message)
+            return
+        if self.waifu2x_install_worker and self.waifu2x_install_worker.isRunning():
+            QMessageBox.information(self, "waifu2x 준비 중", "이미 waifu2x 다운로드/설치 확인이 진행 중입니다.")
+            return
+        self.statusBar().showMessage("waifu2x 다운로드/설치 확인 중...")
+        self.waifu2x_status_btn.setEnabled(False)
+        worker = Waifu2xInstallWorker()
+        self.waifu2x_install_worker = worker
+        worker.finished_result.connect(self._on_waifu2x_install_finished)
+        worker.failed.connect(self._on_waifu2x_install_failed)
+        worker.finished.connect(self._on_waifu2x_install_worker_finished)
+        worker.start()
+
+    def _on_waifu2x_install_finished(self, executable: object) -> None:
+        status = waifu2x_status()
+        message = status.message if status.available else f"waifu2x 준비 결과 확인 필요: {executable}"
+        QMessageBox.information(
+            self,
+            "waifu2x 준비 완료",
+            f"{message}\n\n플랫폼: {status.platform_key}\n캐시: {status.cache_dir}",
+        )
+        self.statusBar().showMessage(message)
+        self.thumbnail_candidate_label.setText(message if not self.last_thumbnail_candidate else self.thumbnail_candidate_label.text())
+
+    def _on_waifu2x_install_failed(self, message: str) -> None:
+        status = waifu2x_status()
+        QMessageBox.warning(
+            self,
+            "waifu2x 준비 실패",
+            f"waifu2x 다운로드/설치 확인에 실패했습니다.\n\n{message}\n\n캐시: {status.cache_dir}\nURL: {status.archive_url}",
+        )
+        self.statusBar().showMessage(f"waifu2x 준비 실패: {message}")
+
+    def _on_waifu2x_install_worker_finished(self) -> None:
+        self.waifu2x_install_worker = None
+        self.waifu2x_status_btn.setEnabled(True)
 
     def _trim_black_borders(self, pixmap: QPixmap) -> QPixmap:
         if pixmap.isNull():
@@ -1206,14 +1442,18 @@ class MainWindow(QMainWindow):
             return pixmap
         return pixmap.scaled(THUMBNAIL_EXPORT_WIDTH, THUMBNAIL_EXPORT_HEIGHT, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
-    def _set_thumbnail_candidate(self, path: Path, pixmap: QPixmap) -> None:
+    def _set_thumbnail_candidate(self, path: Path, pixmap: QPixmap, processing_message: str = "") -> None:
         self.last_thumbnail_candidate = path
         validation = validate_thumbnail_file(path)
         preview = pixmap.scaled(self.thumbnail_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         preview.setDevicePixelRatio(1.0)
         self.thumbnail_preview.setPixmap(preview)
+        self.thumbnail_preview.set_candidate(path, pixmap)
+        details = f"{path.name}\n{pixmap.width()}×{pixmap.height()} · {validation.size_bytes:,} bytes · {validation.mime_type}"
+        if processing_message:
+            details = f"{details}\n{processing_message}"
         self.thumbnail_candidate_label.setText(
-            f"{path.name}\n{pixmap.width()}×{pixmap.height()} · {validation.size_bytes:,} bytes · {validation.mime_type}"
+            details
         )
         self.upload_thumbnail_btn.setEnabled(validation.can_upload)
         self.open_thumbnail_preview_btn.setEnabled(bool(self.current_video))
