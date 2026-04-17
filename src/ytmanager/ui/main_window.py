@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import difflib
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from PySide6.QtCore import QTimer, QUrl, Qt
-from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtGui import QColor, QDesktopServices, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from ytmanager.description import (
@@ -60,12 +61,20 @@ from ytmanager.storage import (
     AppDatabase,
     utc_now_iso,
 )
-from ytmanager.thumbnail import validate_thumbnail_file
+from ytmanager.thumbnail import public_thumbnail_url, public_watch_url, validate_thumbnail_file
 from ytmanager.timestamps import format_timestamp, parse_timestamp
 from ytmanager.youtube_api import YouTubeApiClient, YouTubeApiError
 
-PLAYER_WIDTH = 720
-PLAYER_HEIGHT = 405
+PLAYER_WIDTH = 640
+PLAYER_HEIGHT = 360
+THUMBNAIL_PREVIEW_WIDTH = 256
+THUMBNAIL_PREVIEW_HEIGHT = 144
+THUMBNAIL_EXPORT_WIDTH = 1280
+THUMBNAIL_EXPORT_HEIGHT = 720
+DEFAULT_FRAME_STEP_FPS = 30
+KEYBOARD_SEEK_SECONDS = 5
+BLACK_BORDER_THRESHOLD = 18
+BLACK_BORDER_MIN_CROP_PX = 3
 SECTION_COLUMNS = ["stage_number", "boss_name", "party_composition", "party"]
 FIELD_EXCLUDES = {
     "[tags]",
@@ -93,6 +102,7 @@ PLAYER_HTML = """
     html, body { margin: 0; width: 100%; height: 100%; background: #111; overflow: hidden; color: #eee; font-family: sans-serif; }
     #player { width: 100%; height: 100%; }
     #empty { display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; color: #aaa; }
+    iframe { display: block; background: #000; }
   </style>
 </head>
 <body>
@@ -109,18 +119,32 @@ PLAYER_HTML = """
     function onYouTubeIframeAPIReady() {
       if (pendingVideoId) { loadVideo(pendingVideoId); }
     }
+    function onPlayerReady(event) {
+      if (event && event.target && event.target.pauseVideo) { event.target.pauseVideo(); }
+    }
     function loadVideo(videoId) {
       pendingVideoId = videoId;
       if (!window.YT || !window.YT.Player) { return; }
       if (player) {
-        player.loadVideoById(videoId);
+        if (player.cueVideoById) { player.cueVideoById(videoId); }
+        else { player.loadVideoById(videoId); player.pauseVideo(); }
       } else {
         player = new YT.Player('player', {
           width: '100%',
           height: '100%',
           videoId: videoId,
-          playerVars: { 'playsinline': 1, 'origin': window.location.origin },
-          events: {}
+          playerVars: {
+            'playsinline': 1,
+            'origin': window.location.origin,
+            'controls': 0,
+            'disablekb': 1,
+            'fs': 0,
+            'iv_load_policy': 3,
+            'rel': 0
+          },
+          events: {
+            'onReady': onPlayerReady
+          }
         });
       }
     }
@@ -128,18 +152,79 @@ PLAYER_HTML = """
       if (!player || !player.getCurrentTime) { return 0; }
       return player.getCurrentTime();
     }
+    function getDurationSafe() {
+      if (!player || !player.getDuration) { return 0; }
+      return player.getDuration();
+    }
+    function getPlayerSnapshotSafe() {
+      return {
+        currentTime: getCurrentTimeSafe(),
+        duration: getDurationSafe(),
+        state: (player && player.getPlayerState) ? player.getPlayerState() : 0
+      };
+    }
     function seekToSafe(seconds) {
       if (player && player.seekTo) { player.seekTo(seconds, true); }
     }
+    function seekRelative(delta) {
+      if (!player || !player.getCurrentTime || !player.seekTo) { return 0; }
+      var current = Number(player.getCurrentTime()) || 0;
+      var next = Math.max(0, current + (Number(delta) || 0));
+      player.seekTo(next, true);
+      return next;
+    }
+    function stepFrame(direction, fps) {
+      if (!player || !player.getCurrentTime || !player.seekTo) { return 0; }
+      if (player.pauseVideo) { player.pauseVideo(); }
+      var frameRate = Math.max(1, Number(fps) || 30);
+      var current = Number(player.getCurrentTime()) || 0;
+      var next = Math.max(0, current + (Number(direction) || 0) / frameRate);
+      player.seekTo(next, true);
+      return next;
+    }
     function togglePlayPause() {
       if (!player || !player.getPlayerState) { return; }
-      if (player.getPlayerState() === 1) { player.pauseVideo(); } else { player.playVideo(); }
+      if (player.getPlayerState() === 1) {
+        player.pauseVideo();
+        return;
+      }
+      if (pendingVideoId && player.getPlayerState && player.getPlayerState() === 5 && player.loadVideoById) {
+        player.loadVideoById(pendingVideoId);
+      }
+      if (player.playVideo) { player.playVideo(); }
     }
     loadApi();
   </script>
 </body>
 </html>
 """
+
+
+class MouseShield(QWidget):
+    """투명 마우스 차단막: YouTube iframe hover/click overlay 발생을 막는다."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet("background: transparent;")
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        self.setFocus()
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        event.accept()
+
+    def enterEvent(self, event) -> None:  # type: ignore[override]
+        event.accept()
+
+    def leaveEvent(self, event) -> None:  # type: ignore[override]
+        event.accept()
 
 
 class FixedVideoFrame(QWidget):
@@ -149,15 +234,22 @@ class FixedVideoFrame(QWidget):
         super().__init__()
         self.child = child
         self.child.setParent(self)
+        self.mouse_shield = MouseShield(self)
         self.setFixedSize(width, height)
+        self.child.setFixedSize(width, height)
         self.child.setGeometry(0, 0, width, height)
+        self.mouse_shield.setGeometry(0, 0, width, height)
+        self.mouse_shield.raise_()
         self.child.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet("background-color: #111;")
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         self.child.setGeometry(self.contentsRect())
+        self.mouse_shield.setGeometry(self.contentsRect())
+        self.mouse_shield.raise_()
 
 
 class MainWindow(QMainWindow):
@@ -173,14 +265,22 @@ class MainWindow(QMainWindow):
         self.current_video: Optional[VideoSummary] = None
         self.current_draft: Optional[VideoDraft] = None
         self.current_description_draft: Optional[DescriptionDraftRecord] = None
+        self.last_thumbnail_candidate: Optional[Path] = None
         self.template_text = load_template()
         self.template_library = load_template_library(self.template_text)
         self.rule_mappings = load_rule_mappings()
         self.field_edits: dict[str, QLineEdit] = {}
         self.template_buttons: dict[str, QRadioButton] = {}
+        self._player_shortcuts: list[QShortcut] = []
+        self._player_duration = 0.0
         self._loading_ui = False
 
         self._build_ui()
+        self._install_player_shortcuts()
+        self._player_time_timer = QTimer(self)
+        self._player_time_timer.setInterval(500)
+        self._player_time_timer.timeout.connect(self._refresh_player_time)
+        self._player_time_timer.start()
         self._load_cached_videos()
 
     def _load_character_alias_files(self) -> None:
@@ -239,31 +339,92 @@ class MainWindow(QMainWindow):
         center_layout = QVBoxLayout(center)
         center_layout.setContentsMargins(0, 0, 0, 0)
         center_layout.setSpacing(6)
+
+        player_panel = QWidget()
+        player_layout = QVBoxLayout(player_panel)
+        player_layout.setContentsMargins(0, 0, 0, 0)
+        player_layout.setSpacing(8)
+        player_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
         self.player_title = QLabel(f"재생기 · 고정 16:9 ({PLAYER_WIDTH}×{PLAYER_HEIGHT})")
-        center_layout.addWidget(self.player_title)
+        player_layout.addWidget(self.player_title)
         self.player = QWebEngineView()
+        self.player.setFocusPolicy(Qt.StrongFocus)
+        self.player.settings().setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
         self.player.setHtml(PLAYER_HTML, QUrl("https://ytmanager.local/"))
         self.player_frame = FixedVideoFrame(self.player)
-        center_layout.addWidget(self.player_frame, alignment=Qt.AlignLeft | Qt.AlignTop)
+        player_layout.addWidget(self.player_frame, alignment=Qt.AlignLeft | Qt.AlignTop)
         player_buttons = QHBoxLayout()
-        playpause_btn = QPushButton("재생 / 일시정지")
-        playpause_btn.clicked.connect(self._toggle_player_playback)
-        self._seek_edit = QLineEdit()
-        self._seek_edit.setPlaceholderText("00:00")
-        self._seek_edit.setFixedWidth(72)
-        seek_btn = QPushButton("탐색")
-        seek_btn.clicked.connect(self._seek_player)
+        player_buttons.setSpacing(4)
+        seek_back_btn = QPushButton("⏪")
+        seek_back_btn.setToolTip("5초 뒤로 (←)")
+        seek_back_btn.clicked.connect(lambda: self._seek_player_relative(-KEYBOARD_SEEK_SECONDS))
+        frame_back_btn = QPushButton("◂")
+        frame_back_btn.setToolTip("1프레임 뒤로 (,)")
+        frame_back_btn.clicked.connect(lambda: self._step_player_frame(-1))
+        self.play_pause_btn = QPushButton("⏵")
+        self.play_pause_btn.setToolTip("재생 / 일시정지 (Space)")
+        self.play_pause_btn.clicked.connect(self._toggle_player_playback)
+        frame_forward_btn = QPushButton("▸")
+        frame_forward_btn.setToolTip("1프레임 앞으로 (.)")
+        frame_forward_btn.clicked.connect(lambda: self._step_player_frame(1))
+        seek_forward_btn = QPushButton("⏩")
+        seek_forward_btn.setToolTip("5초 앞으로 (→)")
+        seek_forward_btn.clicked.connect(lambda: self._seek_player_relative(KEYBOARD_SEEK_SECONDS))
+        self.player_time_label = QLabel("00:00 / --:--")
+        self.player_time_label.setMinimumWidth(110)
+        self.player_time_label.setAlignment(Qt.AlignCenter)
         timestamp_btn = QPushButton("현재 시점을 타임스탬프로 추가")
+        timestamp_btn.setToolTip("현재 재생 위치를 설명 타임스탬프에 추가")
         timestamp_btn.clicked.connect(self.add_current_timestamp)
-        capture_btn = QPushButton("현재 화면을 썸네일 후보로 캡처")
+        capture_btn = QPushButton("📸")
+        capture_btn.setToolTip("현재 화면을 썸네일 후보로 캡처")
         capture_btn.clicked.connect(self.capture_thumbnail_candidate)
-        player_buttons.addWidget(playpause_btn)
-        player_buttons.addWidget(self._seek_edit)
-        player_buttons.addWidget(seek_btn)
+        for button in (seek_back_btn, frame_back_btn, self.play_pause_btn, frame_forward_btn, seek_forward_btn, capture_btn):
+            button.setFixedWidth(34)
+        player_buttons.addWidget(seek_back_btn)
+        player_buttons.addWidget(frame_back_btn)
+        player_buttons.addWidget(self.play_pause_btn)
+        player_buttons.addWidget(frame_forward_btn)
+        player_buttons.addWidget(seek_forward_btn)
+        player_buttons.addWidget(self.player_time_label)
         player_buttons.addWidget(timestamp_btn)
         player_buttons.addWidget(capture_btn)
-        center_layout.addLayout(player_buttons)
-        self._setup_player_css_injection()
+        player_buttons.addStretch(1)
+        player_layout.addLayout(player_buttons)
+
+        thumbnail_group = QGroupBox("썸네일 후보 미리보기")
+        thumbnail_layout = QHBoxLayout(thumbnail_group)
+        thumbnail_layout.setContentsMargins(8, 8, 8, 8)
+        thumbnail_layout.setSpacing(10)
+        self.thumbnail_preview = QLabel("캡처한 썸네일 후보가 여기에 표시됩니다.")
+        self.thumbnail_preview.setFixedSize(THUMBNAIL_PREVIEW_WIDTH, THUMBNAIL_PREVIEW_HEIGHT)
+        self.thumbnail_preview.setAlignment(Qt.AlignCenter)
+        self.thumbnail_preview.setStyleSheet("background-color: #111; color: #aaa; border: 1px solid #333;")
+        self.thumbnail_candidate_label = QLabel("후보 없음")
+        self.thumbnail_candidate_label.setWordWrap(True)
+        thumbnail_actions = QVBoxLayout()
+        self.upload_thumbnail_btn = QPushButton("후보 업로드")
+        self.upload_thumbnail_btn.clicked.connect(self._upload_last_thumbnail_candidate)
+        self.upload_thumbnail_btn.setEnabled(False)
+        self.open_thumbnail_preview_btn = QPushButton("웹 썸네일 확인")
+        self.open_thumbnail_preview_btn.clicked.connect(self._open_thumbnail_web_preview)
+        self.open_thumbnail_preview_btn.setEnabled(False)
+        self.open_watch_page_btn = QPushButton("영상 페이지 열기")
+        self.open_watch_page_btn.clicked.connect(self._open_video_watch_page)
+        self.open_watch_page_btn.setEnabled(False)
+        thumbnail_actions.addWidget(self.upload_thumbnail_btn)
+        thumbnail_actions.addWidget(self.open_thumbnail_preview_btn)
+        thumbnail_actions.addWidget(self.open_watch_page_btn)
+        thumbnail_actions.addStretch(1)
+        thumbnail_side = QVBoxLayout()
+        thumbnail_side.addWidget(self.thumbnail_candidate_label)
+        thumbnail_side.addLayout(thumbnail_actions)
+        thumbnail_side.addStretch(1)
+        thumbnail_layout.addWidget(self.thumbnail_preview, alignment=Qt.AlignLeft)
+        thumbnail_layout.addLayout(thumbnail_side, stretch=1)
+        player_layout.addWidget(thumbnail_group)
+        center_layout.addWidget(player_panel, alignment=Qt.AlignLeft | Qt.AlignTop)
         timestamp_panel = QWidget()
         timestamp_layout = QVBoxLayout(timestamp_panel)
         timestamp_layout.setContentsMargins(0, 0, 0, 0)
@@ -491,6 +652,9 @@ class MainWindow(QMainWindow):
             return
         self.current_video = video
         self.current_draft = VideoDraft.from_video(video)
+        self._reset_thumbnail_candidate()
+        self._player_duration = 0.0
+        self._set_player_time_label(0, 0)
         self.player.page().runJavaScript(f"loadVideo({video.video_id!r});")
         draft = self.db.get_description_draft(video.video_id)
         if draft is None and is_managed_title(video.title):
@@ -500,6 +664,15 @@ class MainWindow(QMainWindow):
             self.db.observe_draft_roster(video, draft)
         self._load_draft_into_ui(video, draft)
         self.statusBar().showMessage(f"선택됨: {video.title} · 원본 {video.resolution_label()} · 재생기 16:9 고정")
+
+    def _reset_thumbnail_candidate(self) -> None:
+        self.last_thumbnail_candidate = None
+        self.thumbnail_preview.clear()
+        self.thumbnail_preview.setText("캡처한 썸네일 후보가 여기에 표시됩니다.")
+        self.thumbnail_candidate_label.setText("후보 없음")
+        self.upload_thumbnail_btn.setEnabled(False)
+        self.open_thumbnail_preview_btn.setEnabled(bool(self.current_video))
+        self.open_watch_page_btn.setEnabled(bool(self.current_video))
 
     def _load_draft_into_ui(self, video: VideoSummary, draft: DescriptionDraftRecord | None) -> None:
         self._loading_ui = True
@@ -835,60 +1008,84 @@ class MainWindow(QMainWindow):
         self._load_cached_videos()
         self.statusBar().showMessage("검수 완료 상태를 해제했습니다.")
 
-    def _setup_player_css_injection(self) -> None:
-        try:
-            from PySide6.QtWebEngineCore import QWebEngineScript
-        except ImportError:
+    def _install_player_shortcuts(self) -> None:
+        shortcuts: tuple[tuple[int, Callable[[], None]], ...] = (
+            (Qt.Key_Space, self._toggle_player_playback),
+            (Qt.Key_Left, lambda: self._seek_player_relative(-KEYBOARD_SEEK_SECONDS)),
+            (Qt.Key_Right, lambda: self._seek_player_relative(KEYBOARD_SEEK_SECONDS)),
+            (Qt.Key_Comma, lambda: self._step_player_frame(-1)),
+            (Qt.Key_Period, lambda: self._step_player_frame(1)),
+        )
+        for key, action in shortcuts:
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.setContext(Qt.ApplicationShortcut)
+            shortcut.activated.connect(lambda action=action: self._run_player_shortcut(action))
+            self._player_shortcuts.append(shortcut)
+
+    def _run_player_shortcut(self, action: Callable[[], None]) -> None:
+        if not self.current_video or self._player_shortcut_blocked():
             return
-        css = (
-            ".html5-video-player > div:not(.html5-video-container){"
-            "visibility:hidden !important}"
-            ".ytp-chrome-top,.ytp-gradient-top,.ytp-large-play-button,"
-            ".ytp-cued-thumbnail-overlay,.ytp-pause-overlay,"
-            ".ytp-endscreen-content,.ytp-watermark{"
-            "visibility:hidden !important}"
-        )
-        hide_targets = (
-            "'.ytp-chrome-top','.ytp-gradient-top','.ytp-large-play-button',"
-            "'.ytp-cued-thumbnail-overlay','.ytp-pause-overlay',"
-            "'.ytp-endscreen-content','.ytp-watermark'"
-        )
-        js = (
-            "(function(){"
-            "var s=document.createElement('style');"
-            f"s.textContent={repr(css)};"
-            "(document.head||document.documentElement).appendChild(s);"
-            "function h(){"
-            f"[{hide_targets}].forEach(function(c){{"
-            "document.querySelectorAll(c).forEach(function(e){"
-            "e.style.setProperty('visibility','hidden','important');});}});}"
-            "h();"
-            "new MutationObserver(h).observe("
-            "document.body||document.documentElement,"
-            "{childList:true,subtree:true});"
-            "})();"
-        )
-        script = QWebEngineScript()
-        script.setName("ytmanager_hide_overlay")
-        script.setSourceCode(js)
-        script.setInjectionPoint(QWebEngineScript.DocumentReady)
-        script.setRunsOnSubFrames(True)
-        script.setWorldId(QWebEngineScript.MainWorld)
-        self.player.page().profile().scripts().insert(script)
+        action()
+
+    def _player_shortcut_blocked(self) -> bool:
+        focus = self.focusWidget()
+        while focus:
+            if isinstance(focus, (QLineEdit, QPlainTextEdit, QPushButton)):
+                return True
+            focus = focus.parentWidget()
+        return False
 
     def _toggle_player_playback(self) -> None:
         if not self.current_video:
             return
         self.player.page().runJavaScript("togglePlayPause();")
 
-    def _seek_player(self) -> None:
+    def _step_player_frame(self, direction: int) -> None:
         if not self.current_video:
             return
-        try:
-            seconds = parse_timestamp(self._seek_edit.text().strip())
-        except ValueError:
+        self.player.page().runJavaScript(
+            f"stepFrame({direction}, {DEFAULT_FRAME_STEP_FPS});",
+            self._on_player_position_changed,
+        )
+
+    def _seek_player_relative(self, seconds: int) -> None:
+        if not self.current_video:
             return
-        self.player.page().runJavaScript(f"seekToSafe({seconds});")
+        self.player.page().runJavaScript(f"seekRelative({seconds});", self._on_player_position_changed)
+
+    def _on_player_position_changed(self, value: object) -> None:
+        try:
+            seconds = float(value or 0)
+        except (TypeError, ValueError):
+            return
+        self.statusBar().showMessage(f"재생 위치: {format_timestamp(seconds)} ({seconds:.3f}s)")
+        self._set_player_time_label(seconds, self._player_duration)
+
+    def _refresh_player_time(self) -> None:
+        if not self.current_video:
+            self._set_player_time_label(0, 0)
+            return
+        self.player.page().runJavaScript("getPlayerSnapshotSafe();", self._update_player_snapshot)
+
+    def _update_player_snapshot(self, value: object) -> None:
+        if not isinstance(value, dict):
+            return
+        try:
+            current = float(value.get("currentTime") or 0)
+            duration = float(value.get("duration") or 0)
+            state = int(value.get("state") or 0)
+        except (TypeError, ValueError):
+            return
+        self._player_duration = duration
+        self._set_player_time_label(current, duration)
+        if hasattr(self, "play_pause_btn"):
+            self.play_pause_btn.setText("⏸" if state == 1 else "⏵")
+
+    def _set_player_time_label(self, current: float, duration: float) -> None:
+        if not hasattr(self, "player_time_label"):
+            return
+        duration_text = format_timestamp(duration) if duration > 0 else "--:--"
+        self.player_time_label.setText(f"{format_timestamp(current)} / {duration_text}")
 
     def add_current_timestamp(self) -> None:
         if not self.current_video:
@@ -912,29 +1109,126 @@ class MainWindow(QMainWindow):
         if not self.current_video:
             QMessageBox.information(self, "영상 선택 필요", "먼저 영상을 선택하세요.")
             return
-        self.player.page().runJavaScript("if(player&&player.pauseVideo)player.pauseVideo();")
-        self.statusBar().showMessage("3초 후 캡처합니다... 마우스를 플레이어 밖으로 이동하세요.")
-        QTimer.singleShot(3000, self._do_capture_thumbnail)
+        self.statusBar().showMessage("현재 렌더러 화면을 썸네일 후보로 캡처합니다...")
+        QTimer.singleShot(250, self._do_capture_thumbnail)
 
     def _do_capture_thumbnail(self) -> None:
         if not self.current_video:
             return
-        target = user_cache_dir() / f"thumbnail-{self.current_video.video_id}.png"
-        pixmap: QPixmap = self.player.grab()
-        if not pixmap.save(str(target), "PNG"):
+        target = user_cache_dir() / f"thumbnail-{self.current_video.video_id}.jpg"
+        pixmap = self._resize_thumbnail_candidate(self._trim_black_borders(self.player.grab()))
+        if not pixmap.save(str(target), "JPG", 92):
             QMessageBox.warning(self, "캡처 실패", "현재 재생 화면을 이미지로 저장하지 못했습니다.")
             return
         validation = validate_thumbnail_file(target)
         if not validation.can_upload:
             QMessageBox.warning(self, "썸네일 검증 실패", validation.message)
             return
-        answer = QMessageBox.question(
-            self,
-            "썸네일 후보 생성",
-            f"썸네일 후보를 저장했습니다.\n{target}\n\n이 이미지는 환경에 따라 검은 화면일 수 있으니 확인 후 업로드하세요. 지금 업로드할까요?",
+        self._set_thumbnail_candidate(target, pixmap)
+        self.statusBar().showMessage(f"썸네일 후보 저장 완료: {target}")
+
+    def _trim_black_borders(self, pixmap: QPixmap) -> QPixmap:
+        if pixmap.isNull():
+            return pixmap
+        image = pixmap.toImage()
+        width = image.width()
+        height = image.height()
+        if width <= 0 or height <= 0:
+            return pixmap
+
+        x_step = max(1, width // 240)
+        y_step = max(1, height // 180)
+
+        def is_black(x: int, y: int) -> bool:
+            color = QColor(image.pixel(x, y))
+            return (
+                color.red() <= BLACK_BORDER_THRESHOLD
+                and color.green() <= BLACK_BORDER_THRESHOLD
+                and color.blue() <= BLACK_BORDER_THRESHOLD
+            )
+
+        def mostly_black_row(y: int) -> bool:
+            samples = 0
+            black = 0
+            for x in range(0, width, x_step):
+                samples += 1
+                if is_black(x, y):
+                    black += 1
+            return samples > 0 and black / samples >= 0.98
+
+        def mostly_black_column(x: int) -> bool:
+            samples = 0
+            black = 0
+            for y in range(0, height, y_step):
+                samples += 1
+                if is_black(x, y):
+                    black += 1
+            return samples > 0 and black / samples >= 0.98
+
+        top = 0
+        while top < height and mostly_black_row(top):
+            top += 1
+        bottom = height - 1
+        while bottom > top and mostly_black_row(bottom):
+            bottom -= 1
+        left = 0
+        while left < width and mostly_black_column(left):
+            left += 1
+        right = width - 1
+        while right > left and mostly_black_column(right):
+            right -= 1
+
+        crop_width = right - left + 1
+        crop_height = bottom - top + 1
+        if crop_width <= 0 or crop_height <= 0:
+            return pixmap
+        if min(top, height - 1 - bottom, left, width - 1 - right) < 0:
+            return pixmap
+        if max(top, height - 1 - bottom, left, width - 1 - right) < BLACK_BORDER_MIN_CROP_PX:
+            return pixmap
+        if crop_width < width * 0.45 or crop_height < height * 0.45:
+            return pixmap
+        return pixmap.copy(left, top, crop_width, crop_height)
+
+    def _resize_thumbnail_candidate(self, pixmap: QPixmap) -> QPixmap:
+        if pixmap.isNull():
+            return pixmap
+        aspect = pixmap.width() / pixmap.height() if pixmap.height() else 0
+        target_aspect = THUMBNAIL_EXPORT_WIDTH / THUMBNAIL_EXPORT_HEIGHT
+        if abs(aspect - target_aspect) > 0.05:
+            return pixmap
+        if pixmap.width() == THUMBNAIL_EXPORT_WIDTH and pixmap.height() == THUMBNAIL_EXPORT_HEIGHT:
+            return pixmap
+        return pixmap.scaled(THUMBNAIL_EXPORT_WIDTH, THUMBNAIL_EXPORT_HEIGHT, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+    def _set_thumbnail_candidate(self, path: Path, pixmap: QPixmap) -> None:
+        self.last_thumbnail_candidate = path
+        validation = validate_thumbnail_file(path)
+        preview = pixmap.scaled(self.thumbnail_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        preview.setDevicePixelRatio(1.0)
+        self.thumbnail_preview.setPixmap(preview)
+        self.thumbnail_candidate_label.setText(
+            f"{path.name}\n{pixmap.width()}×{pixmap.height()} · {validation.size_bytes:,} bytes · {validation.mime_type}"
         )
-        if answer == QMessageBox.Yes:
-            self.upload_thumbnail(target)
+        self.upload_thumbnail_btn.setEnabled(validation.can_upload)
+        self.open_thumbnail_preview_btn.setEnabled(bool(self.current_video))
+        self.open_watch_page_btn.setEnabled(bool(self.current_video))
+
+    def _upload_last_thumbnail_candidate(self) -> None:
+        if not self.last_thumbnail_candidate:
+            QMessageBox.information(self, "썸네일 후보 없음", "먼저 현재 화면을 썸네일 후보로 캡처하세요.")
+            return
+        self.upload_thumbnail(self.last_thumbnail_candidate)
+
+    def _open_thumbnail_web_preview(self) -> None:
+        if not self.current_video:
+            return
+        QDesktopServices.openUrl(QUrl(public_thumbnail_url(self.current_video.video_id, cache_bust=True)))
+
+    def _open_video_watch_page(self) -> None:
+        if not self.current_video:
+            return
+        QDesktopServices.openUrl(QUrl(public_watch_url(self.current_video.video_id)))
 
     def upload_thumbnail(self, path: Path) -> None:
         if not self.current_video:
@@ -948,7 +1242,14 @@ class MainWindow(QMainWindow):
                 return
         try:
             self.youtube.upload_thumbnail(self.current_video.video_id, path)
-            QMessageBox.information(self, "업로드 완료", "썸네일을 YouTube에 업로드했습니다.")
+            self.open_thumbnail_preview_btn.setEnabled(True)
+            self.open_watch_page_btn.setEnabled(True)
+            QMessageBox.information(
+                self,
+                "업로드 완료",
+                "썸네일을 YouTube에 업로드했습니다.\n\n"
+                "YouTube 웹 반영은 지연될 수 있습니다. 아래의 '웹 썸네일 확인' 또는 '영상 페이지 열기'로 실제 반영 상태를 확인하세요.",
+            )
         except YouTubeApiError as exc:
             QMessageBox.warning(self, "업로드 실패", str(exc))
         except Exception as exc:

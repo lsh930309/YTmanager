@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from ytmanager.character_master import CharacterMasterEntry, dump_character_master_entries
-from ytmanager.character_sources import SOURCE_CATALOG, collect_source
+from ytmanager.character_sources import collect_source
 from ytmanager.storage import AppDatabase
 
 DEFAULT_BUILD_SOURCES = ("zzz_gg_ko", "hoyodb_hsr_ko", "namu_hsr_ko", "namu_ww_ko", "endfield_wiki_en")

@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ytmanager.character_master import CharacterMasterEntry, load_character_master_entries
+from ytmanager.character_master import CharacterMasterEntry
 from ytmanager.master_builder import build_character_master, merge_master_entries
 from ytmanager.storage import AppDatabase
 
