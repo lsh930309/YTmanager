@@ -70,19 +70,19 @@ from ytmanager.youtube_api import YouTubeApiClient, YouTubeApiError
 
 PLAYER_WIDTH = 640
 PLAYER_HEIGHT = 360
-THUMBNAIL_MODE_PLAYER_WIDTH = 1152
-THUMBNAIL_MODE_PLAYER_HEIGHT = 648
+THUMBNAIL_MODE_PLAYER_WIDTH = 1280
+THUMBNAIL_MODE_PLAYER_HEIGHT = 720
 THUMBNAIL_PREVIEW_WIDTH = 256
 THUMBNAIL_PREVIEW_HEIGHT = 144
-THUMBNAIL_EXPORT_WIDTH = 1280
-THUMBNAIL_EXPORT_HEIGHT = 720
+THUMBNAIL_EXPORT_WIDTH = 2560
+THUMBNAIL_EXPORT_HEIGHT = 1440
 THUMBNAIL_UPSCALE_MODE = "waifu2x"
 THUMBNAIL_KEEP_UPSCALED_PNG = False
 DEFAULT_FRAME_STEP_FPS = 30
 KEYBOARD_SEEK_SECONDS = 5
 BLACK_BORDER_THRESHOLD = 18
 BLACK_BORDER_MIN_CROP_PX = 3
-MODE_ANIMATION_MS = 360
+MODE_ANIMATION_MS = 180
 SECTION_COLUMNS = ["stage_number", "boss_name", "party_composition", "party"]
 FIELD_EXCLUDES = {
     "[tags]",
@@ -472,7 +472,7 @@ class MainWindow(QMainWindow):
 
         self._mode_animation = QVariantAnimation(self)
         self._mode_animation.setDuration(MODE_ANIMATION_MS)
-        self._mode_animation.setEasingCurve(QEasingCurve.InOutCubic)
+        self._mode_animation.setEasingCurve(QEasingCurve.OutCubic)
         self._mode_animation.setStartValue(0.0)
         self._mode_animation.setEndValue(1.0)
 
@@ -488,13 +488,14 @@ class MainWindow(QMainWindow):
             self.main_splitter.setSizes(target_sizes)
             self.right_panel.setVisible(not thumbnail_mode)
             self.timestamp_panel.setVisible(not thumbnail_mode)
+            self.thumbnail_group.setVisible(thumbnail_mode)
 
         self._mode_animation.valueChanged.connect(update_splitter)
         self._mode_animation.finished.connect(finish_splitter)
 
         self._player_size_animation = QVariantAnimation(self)
         self._player_size_animation.setDuration(MODE_ANIMATION_MS)
-        self._player_size_animation.setEasingCurve(QEasingCurve.InOutCubic)
+        self._player_size_animation.setEasingCurve(QEasingCurve.OutCubic)
         self._player_size_animation.setStartValue(0.0)
         self._player_size_animation.setEndValue(1.0)
 
@@ -521,36 +522,6 @@ class MainWindow(QMainWindow):
             self.db.load_character_aliases_from_file(alias_path)
 
     def _build_ui(self) -> None:
-        # --- 툴바 ---
-        toolbar = QToolBar("주요 작업")
-        self.addToolBar(toolbar)
-        login_btn = QPushButton("Google 로그인")
-        login_btn.clicked.connect(self.login)
-        sync_btn = QPushButton("영상 목록 동기화")
-        sync_btn.clicked.connect(self.sync_videos)
-        draft_btn = QPushButton("정규화 초안 생성")
-        draft_btn.clicked.connect(self.generate_drafts_for_cached_videos)
-        bulk_apply_btn = QPushButton("검수 완료 변경분 일괄 적용")
-        bulk_apply_btn.clicked.connect(self.apply_reviewed_drafts)
-        master_btn = QPushButton("캐릭터 마스터 관리")
-        master_btn.clicked.connect(self.open_character_master_window)
-        self.mode_toggle_btn = QPushButton("MetaData")
-        self.mode_toggle_btn.setCheckable(True)
-        self.mode_toggle_btn.setToolTip("MetaData / ThumbNail 작업 모드 전환")
-        self.mode_toggle_btn.toggled.connect(self.set_thumbnail_mode)
-        self.mode_toggle_btn.setStyleSheet(
-            "QPushButton{padding:4px 14px;border-radius:12px;background:#444;color:#eee;}"
-            "QPushButton:checked{background:#1976d2;color:white;}"
-        )
-        toolbar.addWidget(login_btn)
-        toolbar.addWidget(sync_btn)
-        toolbar.addWidget(draft_btn)
-        toolbar.addWidget(bulk_apply_btn)
-        toolbar.addWidget(master_btn)
-        toolbar.addSeparator()
-        toolbar.addWidget(QLabel("Mode"))
-        toolbar.addWidget(self.mode_toggle_btn)
-
         root = QWidget()
         root_layout = QHBoxLayout(root)
         root_layout.setContentsMargins(8, 8, 8, 8)
@@ -576,6 +547,39 @@ class MainWindow(QMainWindow):
         self.video_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.video_list.currentItemChanged.connect(self._on_video_selected)
         left_layout.addWidget(self.video_list, stretch=1)
+
+        # --- 사이드바 액션 버튼 ---
+        _SIDE_BTN_SS = (
+            "QPushButton{text-align:left;padding:5px 8px;"
+            "border:none;border-radius:4px;color:#ccc;background:transparent;}"
+            "QPushButton:hover{background:#2a2a2a;}"
+            "QPushButton:pressed{background:#3a3a3a;}"
+        )
+        side_sep = QFrame()
+        side_sep.setFrameShape(QFrame.HLine)
+        side_sep.setStyleSheet("color:#444;")
+        left_layout.addWidget(side_sep)
+        for _label, _slot in [
+            ("🔑  Google 로그인",       self.login),
+            ("🔄  영상 목록 동기화",     self.sync_videos),
+            ("📝  정규화 초안 생성",     self.generate_drafts_for_cached_videos),
+            ("🚀  검수 완료 일괄 적용",  self.apply_reviewed_drafts),
+            ("📚  캐릭터 마스터 관리",   self.open_character_master_window),
+        ]:
+            _b = QPushButton(_label)
+            _b.setStyleSheet(_SIDE_BTN_SS)
+            _b.clicked.connect(_slot)
+            left_layout.addWidget(_b)
+        self.mode_toggle_btn = QPushButton("MetaData")
+        self.mode_toggle_btn.setCheckable(True)
+        self.mode_toggle_btn.setToolTip("MetaData / ThumbNail 작업 모드 전환")
+        self.mode_toggle_btn.toggled.connect(self.set_thumbnail_mode)
+        self.mode_toggle_btn.setStyleSheet(
+            "QPushButton{padding:5px 8px;border-radius:4px;"
+            "background:#333;color:#ccc;border:none;text-align:left;}"
+            "QPushButton:checked{background:#1565c0;color:white;font-weight:bold;}"
+        )
+        left_layout.addWidget(self.mode_toggle_btn)
         root_layout.addWidget(left)
 
         self.main_splitter = QSplitter(Qt.Horizontal)
@@ -601,44 +605,72 @@ class MainWindow(QMainWindow):
         self.player.setHtml(PLAYER_HTML, QUrl("https://ytmanager.local/"))
         self.player_frame = FixedVideoFrame(self.player)
         player_layout.addWidget(self.player_frame, alignment=Qt.AlignLeft | Qt.AlignTop)
-        player_buttons = QHBoxLayout()
-        player_buttons.setSpacing(4)
-        seek_back_btn = QPushButton("⏪")
-        seek_back_btn.setToolTip("5초 뒤로 (←)")
-        seek_back_btn.clicked.connect(lambda: self._seek_player_relative(-KEYBOARD_SEEK_SECONDS))
-        frame_back_btn = QPushButton("◂")
-        frame_back_btn.setToolTip("1프레임 뒤로 (,)")
-        frame_back_btn.clicked.connect(lambda: self._step_player_frame(-1))
-        self.play_pause_btn = QPushButton("⏵")
-        self.play_pause_btn.setToolTip("재생 / 일시정지 (Space)")
-        self.play_pause_btn.clicked.connect(self._toggle_player_playback)
-        frame_forward_btn = QPushButton("▸")
-        frame_forward_btn.setToolTip("1프레임 앞으로 (.)")
-        frame_forward_btn.clicked.connect(lambda: self._step_player_frame(1))
-        seek_forward_btn = QPushButton("⏩")
-        seek_forward_btn.setToolTip("5초 앞으로 (→)")
-        seek_forward_btn.clicked.connect(lambda: self._seek_player_relative(KEYBOARD_SEEK_SECONDS))
+        _CTRL_BTN_SS = (
+            "QPushButton{background:#2a2a2a;color:#ddd;border:none;"
+            "border-radius:6px;font-size:15px;padding:4px;}"
+            "QPushButton:hover{background:#3a3a3a;}"
+            "QPushButton:pressed{background:#1976d2;color:white;}"
+            "QPushButton:disabled{color:#555;}"
+        )
+        _TS_BTN_SS = (
+            "QPushButton{background:#2a2a2a;color:#bbb;border:none;"
+            "border-radius:6px;padding:4px 10px;font-size:12px;}"
+            "QPushButton:hover{background:#3a3a3a;color:#eee;}"
+        )
+        _CAP_BTN_SS = (
+            "QPushButton{background:#1565c0;color:white;border:none;"
+            "border-radius:6px;padding:4px 14px;font-size:13px;font-weight:bold;}"
+            "QPushButton:hover{background:#1976d2;}"
+            "QPushButton:disabled{background:#333;color:#666;}"
+        )
+
+        # 행 1: seek / play / time
+        ctrl_row1 = QHBoxLayout()
+        ctrl_row1.setSpacing(4)
+        for _icon, _tip, _fn, _w in [
+            ("⏪", "5초 뒤로 (←)",         lambda: self._seek_player_relative(-KEYBOARD_SEEK_SECONDS), 36),
+            ("◂",  "1프레임 뒤로 (,)",      lambda: self._step_player_frame(-1),                        34),
+            ("⏵",  "재생 / 일시정지 (Space)", self._toggle_player_playback,                             38),
+            ("▸",  "1프레임 앞으로 (.)",     lambda: self._step_player_frame(1),                        34),
+            ("⏩", "5초 앞으로 (→)",         lambda: self._seek_player_relative(KEYBOARD_SEEK_SECONDS), 36),
+        ]:
+            _b = QPushButton(_icon)
+            _b.setToolTip(_tip)
+            _b.setFixedSize(_w, 32)
+            _b.setStyleSheet(_CTRL_BTN_SS)
+            _b.clicked.connect(_fn)
+            ctrl_row1.addWidget(_b)
+            if _icon == "⏵":
+                self.play_pause_btn = _b
         self.player_time_label = QLabel("00:00 / --:--")
-        self.player_time_label.setMinimumWidth(110)
+        self.player_time_label.setMinimumWidth(115)
         self.player_time_label.setAlignment(Qt.AlignCenter)
-        timestamp_btn = QPushButton("현재 시점을 타임스탬프로 추가")
+        self.player_time_label.setStyleSheet(
+            "QLabel{background:#1a1a1a;color:#ddd;border-radius:4px;"
+            "padding:2px 6px;font-size:12px;}"
+        )
+        ctrl_row1.addWidget(self.player_time_label)
+        ctrl_row1.addStretch(1)
+
+        # 행 2: timestamp 추가 / 캡처
+        ctrl_row2 = QHBoxLayout()
+        ctrl_row2.setSpacing(6)
+        timestamp_btn = QPushButton("⏱  현재 시점 타임스탬프 추가")
         timestamp_btn.setToolTip("현재 재생 위치를 설명 타임스탬프에 추가")
+        timestamp_btn.setStyleSheet(_TS_BTN_SS)
         timestamp_btn.clicked.connect(self.add_current_timestamp)
-        self.capture_thumbnail_btn = QPushButton("📸")
+        self.capture_thumbnail_btn = QPushButton("📸  캡처")
         self.capture_thumbnail_btn.setToolTip("현재 화면을 썸네일 후보로 캡처")
+        self.capture_thumbnail_btn.setStyleSheet(_CAP_BTN_SS)
         self.capture_thumbnail_btn.clicked.connect(self.capture_thumbnail_candidate)
-        for button in (seek_back_btn, frame_back_btn, self.play_pause_btn, frame_forward_btn, seek_forward_btn, self.capture_thumbnail_btn):
-            button.setFixedWidth(34)
-        player_buttons.addWidget(seek_back_btn)
-        player_buttons.addWidget(frame_back_btn)
-        player_buttons.addWidget(self.play_pause_btn)
-        player_buttons.addWidget(frame_forward_btn)
-        player_buttons.addWidget(seek_forward_btn)
-        player_buttons.addWidget(self.player_time_label)
-        player_buttons.addWidget(timestamp_btn)
-        player_buttons.addWidget(self.capture_thumbnail_btn)
-        player_buttons.addStretch(1)
-        player_layout.addLayout(player_buttons)
+        ctrl_row2.addWidget(timestamp_btn, stretch=1)
+        ctrl_row2.addWidget(self.capture_thumbnail_btn)
+
+        ctrl_layout = QVBoxLayout()
+        ctrl_layout.setSpacing(4)
+        ctrl_layout.addLayout(ctrl_row1)
+        ctrl_layout.addLayout(ctrl_row2)
+        player_layout.addLayout(ctrl_layout)
 
         self.thumbnail_group = QGroupBox("썸네일 후보 미리보기")
         thumbnail_layout = QHBoxLayout(self.thumbnail_group)
@@ -713,6 +745,10 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(template_group)
 
         self.draft_status_label = QLabel("상태: 영상 미선택")
+        self.draft_status_label.setWordWrap(True)
+        self.draft_status_label.setMinimumHeight(26)
+        self.draft_status_label.setMaximumHeight(48)
+        self.draft_status_label.setTextFormat(Qt.RichText)
         right_layout.addWidget(self.draft_status_label)
         right_layout.addWidget(QLabel("상단 태그"))
         self.tags_editor = QLineEdit()
@@ -799,10 +835,19 @@ class MainWindow(QMainWindow):
         save_btn.clicked.connect(self.save_current_draft)
         reviewed_btn = QPushButton("검수 완료")
         reviewed_btn.clicked.connect(self.mark_current_reviewed)
+        reviewed_btn.setStyleSheet(
+            "QPushButton{background:#2e7d32;color:white;border-radius:4px;padding:5px 10px;}"
+            "QPushButton:hover{background:#388e3c;}"
+        )
         unreview_btn = QPushButton("검수 해제")
         unreview_btn.clicked.connect(self.unreview_current_draft)
         apply_selected_btn = QPushButton("선택 적용")
         apply_selected_btn.clicked.connect(self.apply_selected_draft)
+        apply_selected_btn.setStyleSheet(
+            "QPushButton{background:#1565c0;color:white;font-weight:bold;"
+            "border-radius:4px;padding:5px 10px;}"
+            "QPushButton:hover{background:#1976d2;}"
+        )
         draft_buttons.addWidget(save_btn)
         draft_buttons.addWidget(reviewed_btn)
         draft_buttons.addWidget(unreview_btn)
@@ -813,6 +858,16 @@ class MainWindow(QMainWindow):
 
         self.main_splitter.addWidget(self.right_panel)
         self.main_splitter.setSizes([760, 580])
+
+        # 패널 크기 제약 (겹침·잘림 방지)
+        center.setMinimumWidth(660)
+        self.right_panel.setMinimumWidth(400)
+        self.title_editor.setMinimumHeight(28)
+        self.section_tree.setMinimumHeight(80)
+        field_widget.setMinimumHeight(60)
+
+        # MetaData 모드가 기본 — 썸네일 섹션 숨김
+        self.thumbnail_group.setVisible(False)
 
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("준비됨")
@@ -965,16 +1020,26 @@ class MainWindow(QMainWindow):
         self._loading_ui = False
         self.refresh_description_preview()
 
+    _STATUS_BADGE: dict[str | None, str] = {
+        DRAFT_STATUS_DRAFT:    "background:#e6b800;color:#111",
+        DRAFT_STATUS_REVIEWED: "background:#2e7d32;color:white",
+        DRAFT_STATUS_APPLIED:  "background:#1565c0;color:white",
+        DRAFT_STATUS_ERROR:    "background:#c62828;color:white",
+    }
+
     def _draft_status_text(self, draft: DescriptionDraftRecord) -> str:
-        base = STATUS_LABELS.get(draft.status, draft.status)
-        parts = [f"상태: {base}"]
+        ss = self._STATUS_BADGE.get(draft.status, "background:#555;color:#ccc")
+        label = STATUS_LABELS.get(draft.status, draft.status or "—")
+        badge = f'<span style="{ss};border-radius:3px;padding:1px 6px">&nbsp;{label}&nbsp;</span>'
+        parts = [badge]
         if draft.parse_confidence:
             parts.append(f"신뢰도: {draft.parse_confidence}")
         if draft.warnings or draft.unmatched_lines:
-            parts.append(f"확인 필요: {len(draft.warnings) + len(draft.unmatched_lines)}건")
+            issues = len(draft.warnings) + len(draft.unmatched_lines)
+            parts.append(f'<span style="color:#e6b800">⚠ 확인필요: {issues}건</span>')
         if draft.error_message:
-            parts.append(f"오류: {draft.error_message}")
-        return " · ".join(parts)
+            parts.append(f'<span style="color:#f44336">오류: {draft.error_message}</span>')
+        return "&nbsp;·&nbsp;".join(parts)
 
     def _set_draft_status_label(self, text: str) -> None:
         self.draft_status_label.setText(text)
@@ -1011,7 +1076,11 @@ class MainWindow(QMainWindow):
             edit = QLineEdit()
             edit.setText(values.get(name, ""))
             edit.textChanged.connect(self.refresh_description_preview)
-            self.field_form.addRow(name, edit)
+            label = QLabel(name)
+            label.setMinimumWidth(60)
+            label.setMaximumWidth(130)
+            label.setToolTip(name)
+            self.field_form.addRow(label, edit)
             self.field_edits[name] = edit
 
     def _is_general_field_name(self, name: str) -> bool:

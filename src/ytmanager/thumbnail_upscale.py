@@ -9,7 +9,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage
@@ -32,16 +32,16 @@ WAIFU2X_ARCHIVE_URLS = {
         "20250915/waifu2x-ncnn-vulkan-20250915-linux.zip/download"
     ),
 }
-JPEG_QUALITY_STEPS = (92, 88, 84, 80, 76)
-PIL_JPEG_QUALITY_STEPS = (94, 92, 90, 88, 86, 84, 80)
-TARGET_THUMBNAIL_WIDTH = 1280
-TARGET_THUMBNAIL_HEIGHT = 720
+TARGET_THUMBNAIL_WIDTH = 2560
+TARGET_THUMBNAIL_HEIGHT = 1440
 DEFAULT_WAIFU2X_NOISE = 0
 DEFAULT_WAIFU2X_SCALE = 2
 UNSHARP_AMOUNT = 0.32
 PIL_UNSHARP_RADIUS = 0.6
-PIL_UNSHARP_PERCENT = 55
+PIL_UNSHARP_PERCENT = 65
 PIL_UNSHARP_THRESHOLD = 3
+_DOWNSCALE_STEP = 0.9
+_DOWNSCALE_MAX_ITERS = 20
 
 
 class ThumbnailUpscaleError(RuntimeError):
@@ -315,7 +315,6 @@ def finalize_jpeg(
     *,
     target_width: int = TARGET_THUMBNAIL_WIDTH,
     target_height: int = TARGET_THUMBNAIL_HEIGHT,
-    qualities: Sequence[int] = JPEG_QUALITY_STEPS,
     sharpen: bool = True,
 ) -> tuple[int, int, int, int]:
     try:
@@ -324,7 +323,6 @@ def finalize_jpeg(
             output_path,
             target_width=target_width,
             target_height=target_height,
-            qualities=PIL_JPEG_QUALITY_STEPS,
             sharpen=sharpen,
         )
     except ModuleNotFoundError:
@@ -338,14 +336,20 @@ def finalize_jpeg(
         final = apply_subtle_unsharp(final)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    last_quality = qualities[-1]
-    for quality in qualities:
-        if not final.save(str(output_path), "JPG", quality):
+    # quality=100 고정; 2MB 초과 시 Lanczos 90% 다운스케일 반복
+    current = final
+    for _ in range(_DOWNSCALE_MAX_ITERS):
+        if not current.save(str(output_path), "JPG", 100):
             raise ThumbnailUpscaleError("최종 JPEG 저장에 실패했습니다.")
-        last_quality = quality
         if output_path.stat().st_size <= MAX_THUMBNAIL_BYTES:
             break
-    return final.width(), final.height(), last_quality, output_path.stat().st_size
+        current = current.scaled(
+            max(128, int(current.width() * _DOWNSCALE_STEP)),
+            max(72, int(current.height() * _DOWNSCALE_STEP)),
+            Qt.IgnoreAspectRatio,
+            Qt.SmoothTransformation,
+        )
+    return current.width(), current.height(), 100, output_path.stat().st_size
 
 
 def _pil_cover_to_target(image, width: int, height: int):
@@ -372,11 +376,12 @@ def finalize_image_pillow(
     *,
     target_width: int = TARGET_THUMBNAIL_WIDTH,
     target_height: int = TARGET_THUMBNAIL_HEIGHT,
-    qualities: Sequence[int] = PIL_JPEG_QUALITY_STEPS,
     sharpen: bool = True,
     output_format: str = "jpeg",
 ) -> tuple[int, int, int, int]:
     from PIL import Image, ImageFilter
+
+    resampling = getattr(Image, "Resampling", Image).LANCZOS
 
     with Image.open(input_path) as image:
         final = _pil_cover_to_target(image, target_width, target_height)
@@ -397,13 +402,16 @@ def finalize_image_pillow(
     if normalized_format not in {"jpeg", "jpg"}:
         raise ThumbnailUpscaleError(f"지원하지 않는 최종 썸네일 형식입니다: {output_format}")
 
-    last_quality = qualities[-1]
-    for quality in qualities:
-        final.save(output_path, "JPEG", quality=quality, subsampling=0, optimize=True)
-        last_quality = quality
+    # quality=100 고정; 2MB 초과 시 Lanczos 90% 다운스케일 반복
+    current = final
+    for _ in range(_DOWNSCALE_MAX_ITERS):
+        current.save(output_path, "JPEG", quality=100, subsampling=0, optimize=True)
         if output_path.stat().st_size <= MAX_THUMBNAIL_BYTES:
             break
-    return final.width, final.height, last_quality, output_path.stat().st_size
+        new_w = max(128, int(current.width * _DOWNSCALE_STEP))
+        new_h = max(72, int(current.height * _DOWNSCALE_STEP))
+        current = current.resize((new_w, new_h), resampling)
+    return current.width, current.height, 100, output_path.stat().st_size
 
 
 def upscale_thumbnail_candidate(

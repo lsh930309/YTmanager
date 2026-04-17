@@ -12,7 +12,8 @@ except ModuleNotFoundError as exc:  # pragma: no cover - depends on local dev en
 from ytmanager.thumbnail import validate_thumbnail_file
 from ytmanager.thumbnail_upscale import (
     DEFAULT_WAIFU2X_NOISE,
-    PIL_JPEG_QUALITY_STEPS,
+    TARGET_THUMBNAIL_WIDTH,
+    TARGET_THUMBNAIL_HEIGHT,
     ThumbnailUpscaleError,
     Waifu2xStatus,
     apply_subtle_unsharp,
@@ -74,14 +75,14 @@ class ThumbnailUpscaleTests(unittest.TestCase):
             self.assertFalse(status.available)
             self.assertIsNone(status.executable_path)
 
-    def test_finalize_jpeg_outputs_uploadable_1280x720(self):
+    def test_finalize_jpeg_outputs_uploadable(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "source.png"
             output = Path(tmp) / "final.jpg"
             write_test_image(source)
             width, height, quality, size = finalize_jpeg(source, output)
-            self.assertEqual((width, height), (1280, 720))
-            self.assertIn(quality, PIL_JPEG_QUALITY_STEPS)
+            self.assertEqual((width, height), (TARGET_THUMBNAIL_WIDTH, TARGET_THUMBNAIL_HEIGHT))
+            self.assertEqual(quality, 100)
             self.assertGreater(size, 0)
             self.assertTrue(validate_thumbnail_file(output).can_upload)
 
@@ -95,7 +96,7 @@ class ThumbnailUpscaleTests(unittest.TestCase):
             output = Path(tmp) / "final.png"
             write_test_image(source)
             width, height, quality, size = finalize_image_pillow(source, output, output_format="png")
-            self.assertEqual((width, height, quality), (1280, 720, 100))
+            self.assertEqual((width, height, quality), (TARGET_THUMBNAIL_WIDTH, TARGET_THUMBNAIL_HEIGHT, 100))
             self.assertGreater(size, 0)
 
     def test_subtle_unsharp_preserves_size(self):
