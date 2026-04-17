@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 import urllib.request
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ class CharacterSourceDefinition:
     source_name: str
     parser: str
     description: str = ""
+    fetch_fn: str = "html"  # "html" | "json_embed"
 
 
 SOURCE_CATALOG: dict[str, CharacterSourceDefinition] = {
@@ -60,6 +62,33 @@ SOURCE_CATALOG: dict[str, CharacterSourceDefinition] = {
         parser="endfield_wiki_cards",
         description="Arknights: Endfield Wiki 영어 오퍼레이터 목록",
     ),
+    "nanoka_hsr_ko": CharacterSourceDefinition(
+        key="nanoka_hsr_ko",
+        game_key="honkai_starrail",
+        url="https://hsr.nanoka.cc/characters",
+        source_name="nanoka-hsr-ko",
+        parser="nanoka_hsr_cards",
+        description="nanoka.cc 한국어 붕괴: 스타레일 캐릭터 목록",
+        fetch_fn="json_embed",
+    ),
+    "nanoka_ww_ko": CharacterSourceDefinition(
+        key="nanoka_ww_ko",
+        game_key="wuthering_waves",
+        url="https://ww.nanoka.cc/characters",
+        source_name="nanoka-ww-ko",
+        parser="nanoka_ww_cards",
+        description="nanoka.cc 한국어 명조: 워더링 웨이브 공명자 목록",
+        fetch_fn="json_embed",
+    ),
+    "nanoka_zzz_ko": CharacterSourceDefinition(
+        key="nanoka_zzz_ko",
+        game_key="zenless_zone_zero",
+        url="https://zzz.nanoka.cc/characters",
+        source_name="nanoka-zzz-ko",
+        parser="nanoka_zzz_cards",
+        description="nanoka.cc 한국어 젠레스 존 제로 캐릭터 목록",
+        fetch_fn="json_embed",
+    ),
 }
 
 ZZZ_ROLES = ("강공", "격파", "이상", "지원", "방어", "명파")
@@ -98,6 +127,24 @@ WW_ELEMENT_MAP = {
     "회절": "회절",
     "인멸": "인멸",
 }
+NANOKA_HSR_RANK_MAP = {
+    "CombatPowerAvatarRarityType4": "4",
+    "CombatPowerAvatarRarityType5": "5",
+}
+NANOKA_HSR_BASETYPE_MAP = {
+    "Knight": "보존",
+    "Rogue": "수렵",
+    "Mage": "지식",
+    "Warlock": "공허",
+    "Shaman": "화합",
+    "Warrior": "파멸",
+    "Priest": "풍요",
+    "Memory": "기억",
+}
+NANOKA_WW_ELEMENT_MAP = {1: "응결", 2: "용융", 3: "전도", 4: "기류", 5: "회절", 6: "인멸"}
+NANOKA_WW_WEAPON_MAP  = {1: "도검", 2: "장검", 3: "권총", 4: "권갑", 5: "정류기"}
+NANOKA_ZZZ_RANK_MAP    = {3: "A", 4: "S"}
+NANOKA_ZZZ_ELEMENT_MAP = {200: "", 201: "화염", 202: "빙속", 203: "전격", 204: "에테르", 205: "물리"}
 
 
 def fetch_source_html(source: CharacterSourceDefinition, timeout: int = 20) -> str:
@@ -107,11 +154,32 @@ def fetch_source_html(source: CharacterSourceDefinition, timeout: int = 20) -> s
         return response.read().decode(charset, errors="replace")
 
 
+def _fetch_nanoka_embed(source: CharacterSourceDefinition, timeout: int = 20) -> str:
+    page_html = fetch_source_html(source, timeout)
+    m = re.search(
+        r'<script[^>]+data-url="[^"]*static\.nanoka\.cc/[^"]+/character\.json"[^>]*>(.*?)</script>',
+        page_html,
+        re.DOTALL,
+    )
+    if m:
+        return m.group(1).strip()
+    url_m = re.search(r'data-url="(https://static\.nanoka\.cc/[^"]+/character\.json)"', page_html)
+    if not url_m:
+        raise ValueError(f"nanoka.cc: character.json URL을 찾을 수 없음 ({source.url})")
+    req = urllib.request.Request(url_m.group(1), headers={"User-Agent": "Mozilla/5.0 YTmanager/0.1 character-master-builder"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec - known source catalog URL
+        return resp.read().decode("utf-8")
+
+
 def collect_source(source_key: str, html_text: str | None = None) -> list[CharacterMasterEntry]:
     source = SOURCE_CATALOG[source_key]
-    text = html_text if html_text is not None else fetch_source_html(source)
-    parser = _parser_for(source.parser)
-    return parser(text, source)
+    if html_text is not None:
+        text = html_text
+    elif source.fetch_fn == "json_embed":
+        text = _fetch_nanoka_embed(source)
+    else:
+        text = fetch_source_html(source)
+    return _parser_for(source.parser)(text, source)
 
 
 def parse_zzz_gg_cards(text: str, source: CharacterSourceDefinition) -> list[CharacterMasterEntry]:
@@ -313,6 +381,84 @@ def _merge_entries(existing: CharacterMasterEntry, incoming: CharacterMasterEntr
     )
 
 
+def parse_nanoka_hsr_cards(text: str, source: CharacterSourceDefinition) -> list[CharacterMasterEntry]:
+    data: dict = json.loads(text)
+    entries: list[CharacterMasterEntry] = []
+    seen: set[str] = set()
+    for item in data.values():
+        name_ko = _clean_name(item.get("ko", ""))
+        if not name_ko or name_ko.casefold() in seen:
+            continue
+        seen.add(name_ko.casefold())
+        entries.append(
+            CharacterMasterEntry(
+                game_key=source.game_key,
+                canonical_name_ko=name_ko,
+                canonical_name_en=_clean_name(item.get("en", "")),
+                display_name=name_ko,
+                rarity=NANOKA_HSR_RANK_MAP.get(item.get("rank", ""), ""),
+                element=HSR_ATTRIBUTE_MAP.get(item.get("damageType", ""), item.get("damageType", "")),
+                role_or_path=NANOKA_HSR_BASETYPE_MAP.get(item.get("baseType", ""), item.get("baseType", "")),
+                source_name=source.source_name,
+                source_url=source.url,
+            )
+        )
+    return entries
+
+
+def parse_nanoka_ww_cards(text: str, source: CharacterSourceDefinition) -> list[CharacterMasterEntry]:
+    data: dict = json.loads(text)
+    entries: list[CharacterMasterEntry] = []
+    seen: set[str] = set()
+    for item in data.values():
+        name_ko = _clean_name(item.get("ko", ""))
+        if not name_ko or name_ko.casefold() in seen:
+            continue
+        seen.add(name_ko.casefold())
+        element_int = item.get("element")
+        weapon_int = item.get("weapon")
+        entries.append(
+            CharacterMasterEntry(
+                game_key=source.game_key,
+                canonical_name_ko=name_ko,
+                canonical_name_en=_clean_name(item.get("en", "")),
+                display_name=name_ko,
+                rarity=str(item.get("rank", "")),
+                element=NANOKA_WW_ELEMENT_MAP.get(element_int, "") if element_int is not None else "",
+                role_or_path=NANOKA_WW_WEAPON_MAP.get(weapon_int, "") if weapon_int is not None else "",
+                source_name=source.source_name,
+                source_url=source.url,
+            )
+        )
+    return entries
+
+
+def parse_nanoka_zzz_cards(text: str, source: CharacterSourceDefinition) -> list[CharacterMasterEntry]:
+    data: dict = json.loads(text)
+    entries: list[CharacterMasterEntry] = []
+    seen: set[str] = set()
+    for item in data.values():
+        name_ko = _clean_name(item.get("ko", ""))
+        if not name_ko or name_ko.casefold() in seen:
+            continue
+        seen.add(name_ko.casefold())
+        element_int = item.get("element")
+        entries.append(
+            CharacterMasterEntry(
+                game_key=source.game_key,
+                canonical_name_ko=name_ko,
+                canonical_name_en=_clean_name(item.get("en", "")),
+                display_name=name_ko,
+                rarity=NANOKA_ZZZ_RANK_MAP.get(item.get("rank"), "") if item.get("rank") is not None else "",
+                element=NANOKA_ZZZ_ELEMENT_MAP.get(element_int, "") if element_int is not None else "",
+                role_or_path="",
+                source_name=source.source_name,
+                source_url=source.url,
+            )
+        )
+    return entries
+
+
 def _parser_for(name: str) -> Callable[[str, CharacterSourceDefinition], list[CharacterMasterEntry]]:
     parsers = {
         "zzz_gg_cards": parse_zzz_gg_cards,
@@ -320,6 +466,9 @@ def _parser_for(name: str) -> Callable[[str, CharacterSourceDefinition], list[Ch
         "namu_hsr_cards": parse_namu_hsr_cards,
         "namu_ww_cards": parse_namu_ww_cards,
         "endfield_wiki_cards": parse_endfield_wiki_cards,
+        "nanoka_hsr_cards": parse_nanoka_hsr_cards,
+        "nanoka_ww_cards": parse_nanoka_ww_cards,
+        "nanoka_zzz_cards": parse_nanoka_zzz_cards,
     }
     try:
         return parsers[name]

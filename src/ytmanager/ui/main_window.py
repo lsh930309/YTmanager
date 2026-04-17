@@ -45,6 +45,7 @@ from ytmanager.description import (
     render_description_template,
     select_template,
 )
+from ytmanager.ui.character_master_window import CharacterMasterWindow
 from ytmanager.character_status import game_key_from_title_prefix, parse_party_status, format_party_status
 from ytmanager.migration import build_migration_candidates, build_normalized_description, candidate_to_draft_record, is_managed_title
 from ytmanager.models import TimestampEntry, VideoDraft, VideoSummary
@@ -274,6 +275,7 @@ class MainWindow(QMainWindow):
         self._player_shortcuts: list[QShortcut] = []
         self._player_duration = 0.0
         self._loading_ui = False
+        self._character_master_window: Optional[CharacterMasterWindow] = None
 
         self._build_ui()
         self._install_player_shortcuts()
@@ -299,10 +301,13 @@ class MainWindow(QMainWindow):
         draft_btn.clicked.connect(self.generate_drafts_for_cached_videos)
         bulk_apply_btn = QPushButton("검수 완료 변경분 일괄 적용")
         bulk_apply_btn.clicked.connect(self.apply_reviewed_drafts)
+        master_btn = QPushButton("캐릭터 마스터 관리")
+        master_btn.clicked.connect(self.open_character_master_window)
         toolbar.addWidget(login_btn)
         toolbar.addWidget(sync_btn)
         toolbar.addWidget(draft_btn)
         toolbar.addWidget(bulk_apply_btn)
+        toolbar.addWidget(master_btn)
 
         root = QWidget()
         root_layout = QHBoxLayout(root)
@@ -1318,7 +1323,16 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "적용 실패", f"YouTube 업데이트 준비 중 오류가 발생했습니다.\n\n{exc}")
 
+    def open_character_master_window(self) -> None:
+        if self._character_master_window is None:
+            self._character_master_window = CharacterMasterWindow(self.db, self)
+        self._character_master_window.show()
+        self._character_master_window.raise_()
+        self._character_master_window.activateWindow()
+
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self._character_master_window is not None:
+            self._character_master_window.close()
         self.db.close()
         super().closeEvent(event)
 

@@ -518,6 +518,70 @@ class AppDatabase:
             rows = self.connection.execute("SELECT * FROM character_master ORDER BY game_key, canonical_name_ko").fetchall()
         return [self._character_master_from_row(row) for row in rows]
 
+    def delete_character_master(self, game_key: str, canonical_name_ko: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                "DELETE FROM character_master WHERE game_key = ? AND canonical_name_ko = ?",
+                (game_key, canonical_name_ko),
+            )
+
+    def clear_character_master_by_game(self, game_keys: Iterable[str]) -> None:
+        keys = list(game_keys)
+        if not keys:
+            return
+        placeholders = ",".join("?" * len(keys))
+        with self.connection:
+            self.connection.execute(
+                f"DELETE FROM character_master WHERE game_key IN ({placeholders})",
+                keys,
+            )
+
+    def list_aliases(self, game_key: str | None = None) -> list[dict]:
+        if game_key:
+            rows = self.connection.execute(
+                "SELECT game_key, alias, canonical_name, source FROM character_aliases WHERE game_key = ? ORDER BY game_key, alias",
+                (game_key,),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT game_key, alias, canonical_name, source FROM character_aliases ORDER BY game_key, alias"
+            ).fetchall()
+        return [
+            {
+                "game_key": row["game_key"],
+                "alias": row["alias"],
+                "canonical_name": row["canonical_name"],
+                "source": row["source"],
+            }
+            for row in rows
+        ]
+
+    def add_alias(self, game_key: str, alias: str, canonical_name: str, source: str = "manual") -> None:
+        alias = alias.strip()
+        canonical_name = canonical_name.strip()
+        if not alias or not canonical_name:
+            return
+        now = utc_now_iso()
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO character_aliases (game_key, alias, canonical_name, source, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(game_key, alias) DO UPDATE SET
+                    canonical_name = excluded.canonical_name,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                """,
+                (game_key, alias, canonical_name, source, now),
+            )
+
+    def delete_alias(self, game_key: str, alias: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                "DELETE FROM character_aliases WHERE game_key = ? AND alias = ?",
+                (game_key, alias),
+            )
+
     def character_suggestions(self, game_key: str, query: str = "", limit: int = 50) -> list[CharacterSuggestion]:
         normalized_query = query.strip().casefold()
         master_rows = self.connection.execute(

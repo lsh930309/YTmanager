@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,8 +11,25 @@ from ytmanager.character_master import CharacterMasterEntry, dump_character_mast
 from ytmanager.character_sources import collect_source
 from ytmanager.storage import AppDatabase
 
-DEFAULT_BUILD_SOURCES = ("zzz_gg_ko", "hoyodb_hsr_ko", "namu_hsr_ko", "namu_ww_ko", "endfield_wiki_en")
+DEFAULT_BUILD_SOURCES = ("zzz_gg_ko", "hoyodb_hsr_ko", "namu_hsr_ko", "namu_ww_ko", "endfield_wiki_en", "nanoka_hsr_ko", "nanoka_ww_ko", "nanoka_zzz_ko")
 KOREAN_HSR_PATHS = {"파멸", "수렵", "지식", "화합", "공허", "보존", "풍요", "기억", "환락"}
+
+_PUNCT_NORMALIZE_TABLE = str.maketrans({
+    "\u2022": "\u00b7",  # • BULLET → · MIDDLE DOT
+    "\u30fb": "\u00b7",  # ・ KATAKANA MIDDLE DOT
+    "\u2027": "\u00b7",  # ‧ HYPHENATION POINT
+    "\u2219": "\u00b7",  # ∙ BULLET OPERATOR
+    "\uff65": "\u00b7",  # ･ HALFWIDTH KATAKANA MIDDLE DOT
+    "\u2010": "-",       # ‐ HYPHEN
+    "\u2012": "-",       # ‒ FIGURE DASH
+    "\u2013": "-",       # – EN DASH
+    "\u2014": "-",       # — EM DASH
+})
+
+
+def _name_key(name: str) -> str:
+    """중복 제거용 정규화 키: NFKC + 구두점 통일 + casefold."""
+    return unicodedata.normalize("NFKC", name).translate(_PUNCT_NORMALIZE_TABLE).casefold()
 
 
 @dataclass(frozen=True)
@@ -56,7 +74,7 @@ def collect_sources_to_directory(source_keys: Sequence[str], output_dir: Path, c
 def merge_master_entries(entries: Iterable[CharacterMasterEntry]) -> list[CharacterMasterEntry]:
     merged: dict[tuple[str, str], CharacterMasterEntry] = {}
     for entry in entries:
-        key = (entry.game_key, entry.canonical_name_ko.casefold())
+        key = (entry.game_key, _name_key(entry.canonical_name_ko))
         if key not in merged:
             merged[key] = entry
             continue
@@ -65,7 +83,8 @@ def merge_master_entries(entries: Iterable[CharacterMasterEntry]) -> list[Charac
 
 
 def merge_two_entries(existing: CharacterMasterEntry, incoming: CharacterMasterEntry) -> CharacterMasterEntry:
-    aliases = tuple(dict.fromkeys([*existing.aliases_ko, *incoming.aliases_ko]))
+    extra_aliases = [incoming.canonical_name_ko] if incoming.canonical_name_ko != existing.canonical_name_ko else []
+    aliases = tuple(dict.fromkeys([*existing.aliases_ko, *extra_aliases, *incoming.aliases_ko]))
     source_name = existing.source_name if existing.source_name == incoming.source_name else ",".join(dict.fromkeys([*existing.source_name.split(","), *incoming.source_name.split(",")]))
     source_url = existing.source_url if existing.source_url == incoming.source_url else ",".join(value for value in dict.fromkeys([existing.source_url, incoming.source_url]) if value)
     role_or_path = _choose_role_or_path(existing, incoming)
