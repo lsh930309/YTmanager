@@ -11,11 +11,15 @@ except ModuleNotFoundError as exc:  # pragma: no cover - depends on local dev en
 
 from ytmanager.thumbnail import validate_thumbnail_file
 from ytmanager.thumbnail_upscale import (
+    DEFAULT_WAIFU2X_NOISE,
+    PIL_JPEG_QUALITY_STEPS,
     ThumbnailUpscaleError,
     Waifu2xStatus,
+    apply_subtle_unsharp,
     build_waifu2x_command,
     executable_names,
     finalize_jpeg,
+    finalize_image_pillow,
     safe_extract_zip,
     upscale_thumbnail_candidate,
     waifu2x_archive_url,
@@ -50,6 +54,9 @@ class ThumbnailUpscaleTests(unittest.TestCase):
             self.assertIn("-m", command)
             self.assertIn(str(root / "models-cunet"), command)
 
+    def test_default_denoise_is_conservative(self):
+        self.assertEqual(DEFAULT_WAIFU2X_NOISE, 0)
+
     def test_safe_extract_rejects_traversal(self):
         with tempfile.TemporaryDirectory() as tmp:
             archive = Path(tmp) / "bad.zip"
@@ -74,9 +81,30 @@ class ThumbnailUpscaleTests(unittest.TestCase):
             write_test_image(source)
             width, height, quality, size = finalize_jpeg(source, output)
             self.assertEqual((width, height), (1280, 720))
-            self.assertIn(quality, (92, 88, 84, 80, 76))
+            self.assertIn(quality, PIL_JPEG_QUALITY_STEPS)
             self.assertGreater(size, 0)
             self.assertTrue(validate_thumbnail_file(output).can_upload)
+
+    def test_pillow_finalization_supports_png_hook(self):
+        try:
+            import PIL  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("Pillow is required for PNG finalization hook test")
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.png"
+            output = Path(tmp) / "final.png"
+            write_test_image(source)
+            width, height, quality, size = finalize_image_pillow(source, output, output_format="png")
+            self.assertEqual((width, height, quality), (1280, 720, 100))
+            self.assertGreater(size, 0)
+
+    def test_subtle_unsharp_preserves_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.png"
+            write_test_image(source, 16, 9)
+            image = QImage(str(source))
+            sharpened = apply_subtle_unsharp(image)
+            self.assertEqual((sharpened.width(), sharpened.height()), (16, 9))
 
     def test_upscale_falls_back_when_waifu2x_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -89,6 +117,23 @@ class ThumbnailUpscaleTests(unittest.TestCase):
             self.assertEqual(result.engine, "fast")
             self.assertTrue(output.exists())
             self.assertTrue(validate_thumbnail_file(output).can_upload)
+
+    def test_upscale_can_keep_waifu2x_png_without_downscale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.png"
+            output = Path(tmp) / "final.png"
+            write_test_image(source)
+
+            def fake_run(input_path, output_path, **kwargs):
+                write_test_image(output_path, 2560, 1440)
+
+            with mock.patch("ytmanager.thumbnail_upscale.run_waifu2x", side_effect=fake_run):
+                result = upscale_thumbnail_candidate(source, output, mode="waifu2x", keep_upscaled_png=True)
+            self.assertFalse(result.fallback_used)
+            self.assertEqual(result.engine, "waifu2x")
+            self.assertEqual((result.output_width, result.output_height), (2560, 1440))
+            self.assertEqual(result.jpeg_quality, 100)
+            self.assertTrue(output.exists())
 
 
 if __name__ == "__main__":

@@ -33,8 +33,15 @@ WAIFU2X_ARCHIVE_URLS = {
     ),
 }
 JPEG_QUALITY_STEPS = (92, 88, 84, 80, 76)
+PIL_JPEG_QUALITY_STEPS = (94, 92, 90, 88, 86, 84, 80)
 TARGET_THUMBNAIL_WIDTH = 1280
 TARGET_THUMBNAIL_HEIGHT = 720
+DEFAULT_WAIFU2X_NOISE = 0
+DEFAULT_WAIFU2X_SCALE = 2
+UNSHARP_AMOUNT = 0.32
+PIL_UNSHARP_RADIUS = 0.6
+PIL_UNSHARP_PERCENT = 55
+PIL_UNSHARP_THRESHOLD = 3
 
 
 class ThumbnailUpscaleError(RuntimeError):
@@ -163,6 +170,8 @@ def download_file(url: str, destination: Path) -> None:
 def _ensure_executable_permission(path: Path) -> None:
     if current_platform_key() == "windows":
         return
+    if path.stat().st_mode & stat.S_IXUSR:
+        return
     mode = path.stat().st_mode
     path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
@@ -267,6 +276,39 @@ def _cover_to_target(image: QImage, width: int, height: int) -> QImage:
     return scaled.copy(x, y, width, height)
 
 
+def _clamp_color(value: float) -> int:
+    return max(0, min(255, int(round(value))))
+
+
+def apply_subtle_unsharp(image: QImage, amount: float = UNSHARP_AMOUNT) -> QImage:
+    """Apply a conservative unsharp mask tuned for anime/game thumbnail lines."""
+    if image.isNull() or amount <= 0:
+        return image
+    source = image.convertToFormat(QImage.Format_RGBA8888)
+    blurred = source.scaled(
+        max(1, source.width() // 2),
+        max(1, source.height() // 2),
+        Qt.IgnoreAspectRatio,
+        Qt.SmoothTransformation,
+    ).scaled(source.width(), source.height(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    result = QImage(source.size(), QImage.Format_RGBA8888)
+    for y in range(source.height()):
+        for x in range(source.width()):
+            original = source.pixelColor(x, y)
+            soft = blurred.pixelColor(x, y)
+            result.setPixelColor(
+                x,
+                y,
+                original.__class__(
+                    _clamp_color(original.red() + (original.red() - soft.red()) * amount),
+                    _clamp_color(original.green() + (original.green() - soft.green()) * amount),
+                    _clamp_color(original.blue() + (original.blue() - soft.blue()) * amount),
+                    original.alpha(),
+                ),
+            )
+    return result
+
+
 def finalize_jpeg(
     input_path: Path,
     output_path: Path,
@@ -274,11 +316,26 @@ def finalize_jpeg(
     target_width: int = TARGET_THUMBNAIL_WIDTH,
     target_height: int = TARGET_THUMBNAIL_HEIGHT,
     qualities: Sequence[int] = JPEG_QUALITY_STEPS,
+    sharpen: bool = True,
 ) -> tuple[int, int, int, int]:
+    try:
+        return finalize_image_pillow(
+            input_path,
+            output_path,
+            target_width=target_width,
+            target_height=target_height,
+            qualities=PIL_JPEG_QUALITY_STEPS,
+            sharpen=sharpen,
+        )
+    except ModuleNotFoundError:
+        pass
+
     image = QImage(str(input_path))
     if image.isNull():
         raise ThumbnailUpscaleError(f"이미지를 열 수 없습니다: {input_path}")
     final = _cover_to_target(image, target_width, target_height)
+    if sharpen:
+        final = apply_subtle_unsharp(final)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     last_quality = qualities[-1]
@@ -291,14 +348,73 @@ def finalize_jpeg(
     return final.width(), final.height(), last_quality, output_path.stat().st_size
 
 
+def _pil_cover_to_target(image, width: int, height: int):
+    from PIL import Image
+
+    source = image.convert("RGB")
+    source_ratio = source.width / source.height
+    target_ratio = width / height
+    if source_ratio > target_ratio:
+        crop_width = int(round(source.height * target_ratio))
+        left = max(0, (source.width - crop_width) // 2)
+        source = source.crop((left, 0, left + crop_width, source.height))
+    elif source_ratio < target_ratio:
+        crop_height = int(round(source.width / target_ratio))
+        top = max(0, (source.height - crop_height) // 2)
+        source = source.crop((0, top, source.width, top + crop_height))
+    resampling = getattr(Image, "Resampling", Image).LANCZOS
+    return source.resize((width, height), resampling)
+
+
+def finalize_image_pillow(
+    input_path: Path,
+    output_path: Path,
+    *,
+    target_width: int = TARGET_THUMBNAIL_WIDTH,
+    target_height: int = TARGET_THUMBNAIL_HEIGHT,
+    qualities: Sequence[int] = PIL_JPEG_QUALITY_STEPS,
+    sharpen: bool = True,
+    output_format: str = "jpeg",
+) -> tuple[int, int, int, int]:
+    from PIL import Image, ImageFilter
+
+    with Image.open(input_path) as image:
+        final = _pil_cover_to_target(image, target_width, target_height)
+    if sharpen:
+        final = final.filter(
+            ImageFilter.UnsharpMask(
+                radius=PIL_UNSHARP_RADIUS,
+                percent=PIL_UNSHARP_PERCENT,
+                threshold=PIL_UNSHARP_THRESHOLD,
+            )
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    normalized_format = output_format.lower()
+    if normalized_format == "png":
+        final.save(output_path, "PNG", optimize=True)
+        return final.width, final.height, 100, output_path.stat().st_size
+    if normalized_format not in {"jpeg", "jpg"}:
+        raise ThumbnailUpscaleError(f"지원하지 않는 최종 썸네일 형식입니다: {output_format}")
+
+    last_quality = qualities[-1]
+    for quality in qualities:
+        final.save(output_path, "JPEG", quality=quality, subsampling=0, optimize=True)
+        last_quality = quality
+        if output_path.stat().st_size <= MAX_THUMBNAIL_BYTES:
+            break
+    return final.width, final.height, last_quality, output_path.stat().st_size
+
+
 def upscale_thumbnail_candidate(
     input_path: Path,
     output_path: Path,
     *,
     mode: str = "waifu2x",
-    noise: int = 1,
-    scale: int = 2,
+    noise: int = DEFAULT_WAIFU2X_NOISE,
+    scale: int = DEFAULT_WAIFU2X_SCALE,
     timeout_seconds: int = 30,
+    keep_upscaled_png: bool = False,
 ) -> UpscaleResult:
     input_width, input_height = image_dimensions(input_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -330,7 +446,15 @@ def upscale_thumbnail_candidate(
                     scale=scale,
                     timeout_seconds=timeout_seconds,
                 )
-                output_width, output_height, quality, size = finalize_jpeg(waifu_output, output_path)
+                if keep_upscaled_png:
+                    shutil.copy2(waifu_output, output_path)
+                    output_width, output_height = image_dimensions(output_path)
+                    quality = 100
+                    size = output_path.stat().st_size
+                    message = f"처리: waifu2x -n {noise} -s {scale} · png 원본"
+                else:
+                    output_width, output_height, quality, size = finalize_jpeg(waifu_output, output_path)
+                    message = f"처리: waifu2x -n {noise} -s {scale} → downscale · q{quality}"
                 return UpscaleResult(
                     output_path=output_path,
                     mode=mode,
@@ -342,7 +466,7 @@ def upscale_thumbnail_candidate(
                     output_height=output_height,
                     jpeg_quality=quality,
                     size_bytes=size,
-                    message=f"처리: waifu2x -n {noise} -s {scale} → downscale · q{quality}",
+                    message=message,
                 )
             except Exception as exc:
                 output_width, output_height, quality, size = finalize_jpeg(input_path, output_path)

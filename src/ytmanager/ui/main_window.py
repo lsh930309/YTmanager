@@ -4,7 +4,7 @@ import difflib
 from pathlib import Path
 from typing import Callable, Optional
 
-from PySide6.QtCore import QEvent, QThread, QTimer, QUrl, Qt, Signal
+from PySide6.QtCore import QEasingCurve, QEvent, QThread, QTimer, QUrl, Qt, Signal, QVariantAnimation
 from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -70,15 +70,19 @@ from ytmanager.youtube_api import YouTubeApiClient, YouTubeApiError
 
 PLAYER_WIDTH = 640
 PLAYER_HEIGHT = 360
+THUMBNAIL_MODE_PLAYER_WIDTH = 1152
+THUMBNAIL_MODE_PLAYER_HEIGHT = 648
 THUMBNAIL_PREVIEW_WIDTH = 256
 THUMBNAIL_PREVIEW_HEIGHT = 144
 THUMBNAIL_EXPORT_WIDTH = 1280
 THUMBNAIL_EXPORT_HEIGHT = 720
 THUMBNAIL_UPSCALE_MODE = "waifu2x"
+THUMBNAIL_KEEP_UPSCALED_PNG = False
 DEFAULT_FRAME_STEP_FPS = 30
 KEYBOARD_SEEK_SECONDS = 5
 BLACK_BORDER_THRESHOLD = 18
 BLACK_BORDER_MIN_CROP_PX = 3
+MODE_ANIMATION_MS = 360
 SECTION_COLUMNS = ["stage_number", "boss_name", "party_composition", "party"]
 FIELD_EXCLUDES = {
     "[tags]",
@@ -249,6 +253,13 @@ class FixedVideoFrame(QWidget):
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet("background-color: #111;")
 
+    def set_video_size(self, width: int, height: int) -> None:
+        self.setFixedSize(width, height)
+        self.child.setFixedSize(width, height)
+        self.child.setGeometry(0, 0, width, height)
+        self.mouse_shield.setGeometry(0, 0, width, height)
+        self.mouse_shield.raise_()
+
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         self.child.setGeometry(self.contentsRect())
@@ -362,15 +373,27 @@ class ThumbnailUpscaleWorker(QThread):
     finished_result = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, input_path: Path, output_path: Path, mode: str = THUMBNAIL_UPSCALE_MODE) -> None:
+    def __init__(
+        self,
+        input_path: Path,
+        output_path: Path,
+        mode: str = THUMBNAIL_UPSCALE_MODE,
+        keep_upscaled_png: bool = THUMBNAIL_KEEP_UPSCALED_PNG,
+    ) -> None:
         super().__init__()
         self.input_path = input_path
         self.output_path = output_path
         self.mode = mode
+        self.keep_upscaled_png = keep_upscaled_png
 
     def run(self) -> None:  # type: ignore[override]
         try:
-            result = upscale_thumbnail_candidate(self.input_path, self.output_path, mode=self.mode)
+            result = upscale_thumbnail_candidate(
+                self.input_path,
+                self.output_path,
+                mode=self.mode,
+                keep_upscaled_png=self.keep_upscaled_png,
+            )
             self.finished_result.emit(result)
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -411,6 +434,9 @@ class MainWindow(QMainWindow):
         self.template_buttons: dict[str, QRadioButton] = {}
         self._player_shortcuts: list[QShortcut] = []
         self._player_duration = 0.0
+        self._thumbnail_mode = False
+        self._mode_animation: Optional[QVariantAnimation] = None
+        self._player_size_animation: Optional[QVariantAnimation] = None
         self._loading_ui = False
         self._character_master_window: Optional[CharacterMasterWindow] = None
 
@@ -421,6 +447,74 @@ class MainWindow(QMainWindow):
         self._player_time_timer.timeout.connect(self._refresh_player_time)
         self._player_time_timer.start()
         self._load_cached_videos()
+
+    def set_thumbnail_mode(self, enabled: bool) -> None:
+        self._thumbnail_mode = enabled
+        self.mode_toggle_btn.setText("ThumbNail" if enabled else "MetaData")
+        self.mode_toggle_btn.setToolTip(
+            "ThumbNail 모드: 재생기와 썸네일 후보를 크게 표시합니다."
+            if enabled
+            else "MetaData 모드: 설명/태그/타임스탬프 편집을 표시합니다."
+        )
+        self._animate_workspace_mode(enabled)
+
+    def _animate_workspace_mode(self, thumbnail_mode: bool) -> None:
+        total = max(1, sum(self.main_splitter.sizes()))
+        start_sizes = self.main_splitter.sizes()
+        target_sizes = [max(total - 8, int(total * 0.995)), 8] if thumbnail_mode else [760, 580]
+        target_width = THUMBNAIL_MODE_PLAYER_WIDTH if thumbnail_mode else PLAYER_WIDTH
+        target_height = THUMBNAIL_MODE_PLAYER_HEIGHT if thumbnail_mode else PLAYER_HEIGHT
+        start_width = self.player_frame.width()
+        start_height = self.player_frame.height()
+
+        self.timestamp_panel.setVisible(not thumbnail_mode)
+        self.right_panel.setVisible(True)
+
+        self._mode_animation = QVariantAnimation(self)
+        self._mode_animation.setDuration(MODE_ANIMATION_MS)
+        self._mode_animation.setEasingCurve(QEasingCurve.InOutCubic)
+        self._mode_animation.setStartValue(0.0)
+        self._mode_animation.setEndValue(1.0)
+
+        def update_splitter(progress: float) -> None:
+            progress = float(progress)
+            sizes = [
+                int(start_sizes[0] + (target_sizes[0] - start_sizes[0]) * progress),
+                int(start_sizes[1] + (target_sizes[1] - start_sizes[1]) * progress),
+            ]
+            self.main_splitter.setSizes(sizes)
+
+        def finish_splitter() -> None:
+            self.main_splitter.setSizes(target_sizes)
+            self.right_panel.setVisible(not thumbnail_mode)
+            self.timestamp_panel.setVisible(not thumbnail_mode)
+
+        self._mode_animation.valueChanged.connect(update_splitter)
+        self._mode_animation.finished.connect(finish_splitter)
+
+        self._player_size_animation = QVariantAnimation(self)
+        self._player_size_animation.setDuration(MODE_ANIMATION_MS)
+        self._player_size_animation.setEasingCurve(QEasingCurve.InOutCubic)
+        self._player_size_animation.setStartValue(0.0)
+        self._player_size_animation.setEndValue(1.0)
+
+        def update_player(progress: float) -> None:
+            progress = float(progress)
+            width = int(start_width + (target_width - start_width) * progress)
+            height = int(start_height + (target_height - start_height) * progress)
+            self.player_frame.set_video_size(width, height)
+            self.player_title.setText(f"재생기 · {'썸네일 집중' if thumbnail_mode else '고정 16:9'} ({width}×{height})")
+
+        def finish_player() -> None:
+            self.player_frame.set_video_size(target_width, target_height)
+            self.player_title.setText(
+                f"재생기 · {'썸네일 집중' if thumbnail_mode else '고정 16:9'} ({target_width}×{target_height})"
+            )
+
+        self._player_size_animation.valueChanged.connect(update_player)
+        self._player_size_animation.finished.connect(finish_player)
+        self._mode_animation.start()
+        self._player_size_animation.start()
 
     def _load_character_alias_files(self) -> None:
         for alias_path in (Path.cwd() / "character_aliases.json", user_data_dir() / "character_aliases.json"):
@@ -440,11 +534,22 @@ class MainWindow(QMainWindow):
         bulk_apply_btn.clicked.connect(self.apply_reviewed_drafts)
         master_btn = QPushButton("캐릭터 마스터 관리")
         master_btn.clicked.connect(self.open_character_master_window)
+        self.mode_toggle_btn = QPushButton("MetaData")
+        self.mode_toggle_btn.setCheckable(True)
+        self.mode_toggle_btn.setToolTip("MetaData / ThumbNail 작업 모드 전환")
+        self.mode_toggle_btn.toggled.connect(self.set_thumbnail_mode)
+        self.mode_toggle_btn.setStyleSheet(
+            "QPushButton{padding:4px 14px;border-radius:12px;background:#444;color:#eee;}"
+            "QPushButton:checked{background:#1976d2;color:white;}"
+        )
         toolbar.addWidget(login_btn)
         toolbar.addWidget(sync_btn)
         toolbar.addWidget(draft_btn)
         toolbar.addWidget(bulk_apply_btn)
         toolbar.addWidget(master_btn)
+        toolbar.addSeparator()
+        toolbar.addWidget(QLabel("Mode"))
+        toolbar.addWidget(self.mode_toggle_btn)
 
         root = QWidget()
         root_layout = QHBoxLayout(root)
@@ -473,8 +578,8 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.video_list, stretch=1)
         root_layout.addWidget(left)
 
-        main_splitter = QSplitter(Qt.Horizontal)
-        root_layout.addWidget(main_splitter, stretch=1)
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        root_layout.addWidget(self.main_splitter, stretch=1)
 
         # --- 중앙: 재생기 + 타임스탬프 ---
         center = QWidget()
@@ -482,11 +587,11 @@ class MainWindow(QMainWindow):
         center_layout.setContentsMargins(0, 0, 0, 0)
         center_layout.setSpacing(6)
 
-        player_panel = QWidget()
-        player_layout = QVBoxLayout(player_panel)
+        self.player_panel = QWidget()
+        player_layout = QVBoxLayout(self.player_panel)
         player_layout.setContentsMargins(0, 0, 0, 0)
         player_layout.setSpacing(8)
-        player_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.player_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
         self.player_title = QLabel(f"재생기 · 고정 16:9 ({PLAYER_WIDTH}×{PLAYER_HEIGHT})")
         player_layout.addWidget(self.player_title)
@@ -535,8 +640,8 @@ class MainWindow(QMainWindow):
         player_buttons.addStretch(1)
         player_layout.addLayout(player_buttons)
 
-        thumbnail_group = QGroupBox("썸네일 후보 미리보기")
-        thumbnail_layout = QHBoxLayout(thumbnail_group)
+        self.thumbnail_group = QGroupBox("썸네일 후보 미리보기")
+        thumbnail_layout = QHBoxLayout(self.thumbnail_group)
         thumbnail_layout.setContentsMargins(8, 8, 8, 8)
         thumbnail_layout.setSpacing(10)
         self.thumbnail_preview = ThumbnailPreviewLabel("캡처한 썸네일 후보가 여기에 표시됩니다.")
@@ -568,10 +673,10 @@ class MainWindow(QMainWindow):
         thumbnail_side.addStretch(1)
         thumbnail_layout.addWidget(self.thumbnail_preview, alignment=Qt.AlignLeft)
         thumbnail_layout.addLayout(thumbnail_side, stretch=1)
-        player_layout.addWidget(thumbnail_group)
-        center_layout.addWidget(player_panel, alignment=Qt.AlignLeft | Qt.AlignTop)
-        timestamp_panel = QWidget()
-        timestamp_layout = QVBoxLayout(timestamp_panel)
+        player_layout.addWidget(self.thumbnail_group)
+        center_layout.addWidget(self.player_panel, alignment=Qt.AlignLeft | Qt.AlignTop)
+        self.timestamp_panel = QWidget()
+        timestamp_layout = QVBoxLayout(self.timestamp_panel)
         timestamp_layout.setContentsMargins(0, 0, 0, 0)
         timestamp_layout.setSpacing(4)
         timestamp_layout.addWidget(QLabel("타임스탬프"))
@@ -579,12 +684,12 @@ class MainWindow(QMainWindow):
         self.timestamp_editor.setPlaceholderText("타임스탬프가 여기에 누적됩니다. 예: 01:23 - 보스전 시작")
         self.timestamp_editor.textChanged.connect(self.refresh_description_preview)
         timestamp_layout.addWidget(self.timestamp_editor, stretch=1)
-        center_layout.addWidget(timestamp_panel, stretch=1)
-        main_splitter.addWidget(center)
+        center_layout.addWidget(self.timestamp_panel, stretch=1)
+        self.main_splitter.addWidget(center)
 
         # --- 오른쪽: 메타데이터 + 미리보기 ---
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
+        self.right_panel = QWidget()
+        right_layout = QVBoxLayout(self.right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(6)
 
@@ -706,8 +811,8 @@ class MainWindow(QMainWindow):
         right_splitter.addWidget(preview_panel)
         right_splitter.setSizes([380, 480])
 
-        main_splitter.addWidget(right)
-        main_splitter.setSizes([760, 580])
+        self.main_splitter.addWidget(self.right_panel)
+        self.main_splitter.setSizes([760, 580])
 
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("준비됨")
@@ -1276,7 +1381,8 @@ class MainWindow(QMainWindow):
             return
         cache_dir = user_cache_dir()
         raw_target = cache_dir / f"thumbnail-{self.current_video.video_id}-raw.png"
-        final_target = cache_dir / f"thumbnail-{self.current_video.video_id}.jpg"
+        suffix = "png" if THUMBNAIL_KEEP_UPSCALED_PNG else "jpg"
+        final_target = cache_dir / f"thumbnail-{self.current_video.video_id}.{suffix}"
         pixmap = self._trim_black_borders(self.player.grab())
         if not pixmap.save(str(raw_target), "PNG"):
             QMessageBox.warning(self, "캡처 실패", "현재 재생 화면을 원본 후보 이미지로 저장하지 못했습니다.")
@@ -1304,10 +1410,12 @@ class MainWindow(QMainWindow):
             return
         validation = validate_thumbnail_file(result.output_path)
         if not validation.can_upload:
-            QMessageBox.warning(self, "썸네일 검증 실패", validation.message)
-            self.statusBar().showMessage(f"썸네일 검증 실패: {validation.message}")
-            self._set_thumbnail_processing(False)
-            return
+            if result.output_path.suffix.lower() != ".png":
+                QMessageBox.warning(self, "썸네일 검증 실패", validation.message)
+                self.statusBar().showMessage(f"썸네일 검증 실패: {validation.message}")
+                self._set_thumbnail_processing(False)
+                return
+            self.statusBar().showMessage(f"PNG 비교 후보 생성 완료: {validation.message}")
         self._set_thumbnail_candidate(result.output_path, pixmap, result.message)
         fallback_note = " (fallback)" if result.fallback_used else ""
         self.statusBar().showMessage(f"썸네일 후보 저장 완료{fallback_note}: {result.output_path}")

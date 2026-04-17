@@ -16,6 +16,7 @@ dependencies = [
   "google-auth-httplib2>=0.2",
   "google-auth-oauthlib>=1.2",
   "keyring>=25",
+  "Pillow>=10.4",
 ]
 
 [project.optional-dependencies]
