@@ -65,7 +65,7 @@ SOURCE_CATALOG: dict[str, CharacterSourceDefinition] = {
     "nanoka_hsr_ko": CharacterSourceDefinition(
         key="nanoka_hsr_ko",
         game_key="honkai_starrail",
-        url="https://hsr.nanoka.cc/characters",
+        url="https://hsr.nanoka.cc/",
         source_name="nanoka-hsr-ko",
         parser="nanoka_hsr_cards",
         description="nanoka.cc 한국어 붕괴: 스타레일 캐릭터 목록",
@@ -74,7 +74,7 @@ SOURCE_CATALOG: dict[str, CharacterSourceDefinition] = {
     "nanoka_ww_ko": CharacterSourceDefinition(
         key="nanoka_ww_ko",
         game_key="wuthering_waves",
-        url="https://ww.nanoka.cc/characters",
+        url="https://ww.nanoka.cc/",
         source_name="nanoka-ww-ko",
         parser="nanoka_ww_cards",
         description="nanoka.cc 한국어 명조: 워더링 웨이브 공명자 목록",
@@ -83,7 +83,7 @@ SOURCE_CATALOG: dict[str, CharacterSourceDefinition] = {
     "nanoka_zzz_ko": CharacterSourceDefinition(
         key="nanoka_zzz_ko",
         game_key="zenless_zone_zero",
-        url="https://zzz.nanoka.cc/characters",
+        url="https://zzz.nanoka.cc/",
         source_name="nanoka-zzz-ko",
         parser="nanoka_zzz_cards",
         description="nanoka.cc 한국어 젠레스 존 제로 캐릭터 목록",
@@ -162,7 +162,15 @@ def _fetch_nanoka_embed(source: CharacterSourceDefinition, timeout: int = 20) ->
         re.DOTALL,
     )
     if m:
-        return m.group(1).strip()
+        raw = m.group(1).strip()
+        # SvelteKit은 {"status":200,"statusText":"OK","headers":{},"body":"..."} 래퍼로 감쌈
+        try:
+            wrapper = json.loads(raw)
+            if isinstance(wrapper, dict) and "body" in wrapper:
+                return wrapper["body"] if isinstance(wrapper["body"], str) else json.dumps(wrapper["body"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return raw
     url_m = re.search(r'data-url="(https://static\.nanoka\.cc/[^"]+/character\.json)"', page_html)
     if not url_m:
         raise ValueError(f"nanoka.cc: character.json URL을 찾을 수 없음 ({source.url})")
