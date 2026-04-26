@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import locale
 import platform
 import shutil
 import stat
@@ -9,6 +10,7 @@ import tarfile
 import tempfile
 import urllib.request
 import zipfile
+from hashlib import sha1
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -174,10 +176,10 @@ def find_ffmpeg_binaries(root: Path) -> tuple[Path, Path]:
 
 
 def inspect_ffmpeg_version(ffmpeg_path: Path) -> str:
-    completed = subprocess.run([str(ffmpeg_path), "-version"], capture_output=True, text=True, check=False)
+    completed = subprocess.run([str(ffmpeg_path), "-version"], capture_output=True, check=False)
     if completed.returncode != 0:
-        raise FFmpegToolsError((completed.stderr or completed.stdout or "ffmpeg 버전 확인 실패").strip())
-    first_line = (completed.stdout or "").splitlines()[0].strip()
+        raise FFmpegToolsError((_decode_process_output(completed.stderr) or _decode_process_output(completed.stdout) or "ffmpeg 버전 확인 실패").strip())
+    first_line = (_decode_process_output(completed.stdout) or "").splitlines()[0].strip()
     return first_line or FFMPEG_MANAGED_VERSION
 
 
@@ -395,12 +397,12 @@ def split_video_segments(
         if segment.duration_seconds <= 0:
             raise FFmpegToolsError(f"세그먼트 길이가 0초 이하입니다: {segment.index}")
         suffix = source.suffix or ".mp4"
-        filename = f"{source.stem}-{segment.index:02d}-{sanitize_filename(segment.title) or 'segment'}{suffix}"
+        filename = build_safe_segment_filename(source, segment.index, suffix)
         target = output_root / filename
         command = build_ffmpeg_split_command(ffmpeg, source, target, segment.start_seconds, segment.duration_seconds)
-        completed = runner(command, capture_output=True, text=True, check=False)
+        completed = runner(command, capture_output=True, check=False)
         if completed.returncode != 0:
-            stderr = (completed.stderr or completed.stdout or "").strip()
+            stderr = (_decode_process_output(completed.stderr) or _decode_process_output(completed.stdout) or "").strip()
             raise FFmpegToolsError(f"ffmpeg 분할 실패: {stderr[:400] or completed.returncode}")
         if not target.exists():
             raise FFmpegToolsError(f"분할 결과 파일이 생성되지 않았습니다: {target}")
@@ -467,9 +469,9 @@ def capture_video_frame(
     target = Path(output_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     command = build_ffmpeg_frame_capture_command(Path(ffmpeg_path), source, target, seconds)
-    completed = runner(command, capture_output=True, text=True, check=False)
+    completed = runner(command, capture_output=True, check=False)
     if completed.returncode != 0:
-        stderr = (completed.stderr or completed.stdout or "").strip()
+        stderr = (_decode_process_output(completed.stderr) or _decode_process_output(completed.stdout) or "").strip()
         raise FFmpegToolsError(f"ffmpeg 프레임 캡처 실패: {stderr[:400] or completed.returncode}")
     if not target.exists():
         raise FFmpegToolsError(f"프레임 캡처 파일이 생성되지 않았습니다: {target}")
@@ -486,18 +488,23 @@ def sanitize_filename(value: str) -> str:
     return text[:80].rstrip(" .")
 
 
+def build_safe_segment_filename(source_path: Path, segment_index: int, suffix: str) -> str:
+    digest = sha1(str(source_path).encode("utf-8")).hexdigest()[:10]
+    return f"segment-{digest}-{segment_index:02d}{suffix}"
+
+
 def _run_ffprobe_json(
     ffprobe_path: Path,
     arguments: Sequence[str],
     *,
     runner: Callable[..., subprocess.CompletedProcess[str]],
 ) -> Mapping[str, Any]:
-    completed = runner([str(ffprobe_path), *arguments], capture_output=True, text=True, check=False)
+    completed = runner([str(ffprobe_path), *arguments], capture_output=True, check=False)
     if completed.returncode != 0:
-        stderr = (completed.stderr or completed.stdout or "").strip()
+        stderr = (_decode_process_output(completed.stderr) or _decode_process_output(completed.stdout) or "").strip()
         raise FFmpegToolsError(f"ffprobe 실행 실패: {stderr[:400] or completed.returncode}")
     try:
-        return json.loads(completed.stdout or "{}")
+        return json.loads(_decode_process_output(completed.stdout) or "{}")
     except json.JSONDecodeError as exc:
         raise FFmpegToolsError("ffprobe JSON 파싱에 실패했습니다.") from exc
 
@@ -532,3 +539,17 @@ def _safe_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _decode_process_output(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        preferred = locale.getpreferredencoding(False) or "utf-8"
+        try:
+            return value.decode(preferred)
+        except UnicodeDecodeError:
+            return value.decode("utf-8", errors="replace")
+    return str(value)

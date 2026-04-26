@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from ytmanager.ffmpeg_tools import (
+    build_safe_segment_filename,
     build_ffmpeg_frame_capture_command,
     build_ffmpeg_split_command,
     parse_ffprobe_keyframes,
@@ -40,6 +41,12 @@ class FFmpegToolsTests(unittest.TestCase):
         self.assertEqual(command[:6], ["ffmpeg", "-y", "-ss", "33.300", "-i", "input.mp4"])
         self.assertEqual(command[-1], "frame.jpg")
 
+    def test_build_safe_segment_filename_avoids_unicode_title_dependency(self):
+        filename = build_safe_segment_filename(Path("/tmp/한글원본.mp4"), 2, ".mp4")
+        self.assertTrue(filename.startswith("segment-"))
+        self.assertTrue(filename.endswith("-02.mp4"))
+        self.assertNotIn("한글", filename)
+
     def test_read_probe_created_at_prefers_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "sample.mp4"
@@ -52,7 +59,7 @@ class FFmpegToolsTests(unittest.TestCase):
             source = Path(tmp) / "sample.mp4"
             source.write_bytes(b"x")
 
-            def runner(command, capture_output, text, check):
+            def runner(command, capture_output, check, text=None):
                 if "-show_format" in command:
                     stdout = json.dumps(
                         {

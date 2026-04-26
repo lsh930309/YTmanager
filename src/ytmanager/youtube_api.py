@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from ytmanager.models import VideoSummary
 from ytmanager.thumbnail import validate_thumbnail_file
@@ -163,6 +163,7 @@ class YouTubeApiClient:
         privacy_status: str,
         media_path: Path,
         category_id: str = "22",
+        progress_callback: Callable[[float], None] | None = None,
     ) -> Mapping[str, Any]:
         if not media_path.exists():
             raise YouTubeApiError(f"업로드할 영상 파일을 찾을 수 없습니다: {media_path}")
@@ -180,8 +181,17 @@ class YouTubeApiClient:
         media = MediaFileUpload(str(media_path), resumable=True)
         request = self.service.videos().insert(part="snippet,status", body=body, media_body=media)
         response = None
+        if progress_callback is not None:
+            progress_callback(0.0)
         while response is None:
-            _status, response = request.next_chunk()
+            status, response = request.next_chunk()
+            if progress_callback is not None and status is not None:
+                try:
+                    progress_callback(max(0.0, min(1.0, float(status.progress()))))
+                except Exception:
+                    pass
+        if progress_callback is not None:
+            progress_callback(1.0)
         return response
 
     def upload_thumbnail(self, video_id: str, image_path: Path) -> Mapping[str, Any]:

@@ -129,6 +129,9 @@ class UploadProcessSummary:
     items: list[UploadQueueItem] = field(default_factory=list)
 
 
+ProgressCallback = Callable[[int, int, float, str], None]
+
+
 @dataclass
 class LocalSourceSession:
     source_path: Path
@@ -390,15 +393,19 @@ class LocalUploadController:
         ffmpeg_path: Path | str,
         output_dir: Path,
         source_path: Path | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> UploadProcessSummary:
         session = self.require_session()
         if not self.queue:
             self.build_queue()
         succeeded = 0
         failed = 0
-        for item in self.queue:
+        total = len(self.queue)
+        for position, item in enumerate(self.queue, start=1):
             item.status = QUEUE_STATUS_PROCESSING
             item.error_message = ""
+            if progress_callback is not None:
+                progress_callback(position, total, 0.0, f"분할 준비 중 · {item.segment.title}")
             try:
                 outputs = self.splitter(
                     source_path or session.source_path,
@@ -407,6 +414,8 @@ class LocalUploadController:
                     Path(ffmpeg_path),
                 )
                 item.output_path = outputs[0]
+                if progress_callback is not None:
+                    progress_callback(position, total, 0.1, f"업로드 준비 완료 · {item.segment.title}")
                 response = self.uploader(
                     youtube_client,
                     title=item.segment.title,
@@ -414,14 +423,28 @@ class LocalUploadController:
                     tags=item.segment.tags,
                     privacy_status=item.segment.privacy_status,
                     media_path=item.output_path,
+                    progress_callback=(
+                        None
+                        if progress_callback is None
+                        else lambda fraction, position=position, total=total, title=item.segment.title: progress_callback(
+                            position,
+                            total,
+                            0.1 + max(0.0, min(1.0, fraction)) * 0.9,
+                            f"업로드 중 · {title}",
+                        )
+                    ),
                 )
                 item.uploaded_video_id = str(response.get("id", ""))
                 item.status = QUEUE_STATUS_UPLOADED
                 succeeded += 1
+                if progress_callback is not None:
+                    progress_callback(position, total, 1.0, f"업로드 완료 · {item.segment.title}")
             except Exception as exc:
                 item.status = QUEUE_STATUS_FAILED
                 item.error_message = str(exc)
                 failed += 1
+                if progress_callback is not None:
+                    progress_callback(position, total, 1.0, f"업로드 실패 · {item.segment.title}")
         return UploadProcessSummary(total=len(self.queue), succeeded=succeeded, failed=failed, items=list(self.queue))
 
     def active_segment_index(self, seconds: float) -> int | None:
@@ -576,6 +599,7 @@ def upload_local_video_segment(
     tags: Sequence[str],
     privacy_status: str,
     media_path: Path,
+    progress_callback: Callable[[float], None] | None = None,
 ) -> dict[str, Any]:
     return youtube_client.upload_video(
         title=title,
@@ -583,6 +607,7 @@ def upload_local_video_segment(
         tags=list(tags),
         privacy_status=privacy_status,
         media_path=media_path,
+        progress_callback=progress_callback,
     )
 
 

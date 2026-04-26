@@ -449,6 +449,7 @@ class MainWindow(QMainWindow):
         self._player_time_timer.setInterval(500)
         self._player_time_timer.timeout.connect(self._refresh_player_time)
         self._player_time_timer.start()
+        self._restore_google_session_if_available()
         self._load_cached_videos()
 
     def set_thumbnail_mode(self, enabled: bool) -> None:
@@ -923,6 +924,18 @@ class MainWindow(QMainWindow):
         if not self.youtube:
             self.login()
         return self.youtube
+
+    def _restore_google_session_if_available(self) -> None:
+        if self.youtube or not self.oauth.has_saved_login():
+            return
+        try:
+            service = self.oauth.build_cached_youtube_service(write_access=True)
+        except Exception:
+            service = None
+        if service is None:
+            return
+        self.youtube = YouTubeApiClient(service)
+        self.statusBar().showMessage("저장된 Google 로그인 상태를 복원했습니다.")
 
     def _set_workspace(self, index: int, checked: bool) -> None:
         if not checked:

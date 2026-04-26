@@ -74,6 +74,18 @@ class TokenStore:
         except FileNotFoundError:
             pass
 
+    def exists(self) -> bool:
+        file_token = self._token_file()
+        try:
+            import keyring
+        except ImportError:
+            return file_token.exists()
+        try:
+            raw = keyring.get_password(self.service_name, self.account_name)
+        except Exception:
+            raw = None
+        return bool(raw) or file_token.exists()
+
     def _token_file(self) -> Path:
         return user_data_dir() / "token.json"
 
@@ -98,10 +110,7 @@ class OAuthManager:
         self.token_store = token_store or TokenStore()
 
     def login(self, write_access: bool = False) -> Any:
-        scopes = list(DEFAULT_READ_SCOPES)
-        if write_access:
-            scopes = list(dict.fromkeys(scopes + DEFAULT_WRITE_SCOPES))
-        config = OAuthClientConfig.discover(scopes)
+        config = self._discover_config(write_access)
         try:
             from google.oauth2.credentials import Credentials
             from google.auth.transport.requests import Request
@@ -109,6 +118,46 @@ class OAuthManager:
         except ImportError as exc:
             raise OAuthSetupError("Google OAuth 패키지가 설치되어 있지 않습니다.") from exc
 
+        credentials = self._load_cached_credentials(config, Credentials, Request)
+        if not credentials or not credentials.valid:
+            flow = InstalledAppFlow.from_client_secrets_file(str(config.client_secret_path), list(config.scopes))
+            credentials = flow.run_local_server(host="127.0.0.1", port=0, open_browser=True)
+            self.token_store.save(json.loads(credentials.to_json()))
+        return credentials
+
+    def has_saved_login(self) -> bool:
+        return self.token_store.exists()
+
+    def build_cached_youtube_service(self, write_access: bool = False) -> Any | None:
+        if not self.token_store.exists():
+            return None
+        config = self._discover_config(write_access)
+        try:
+            from google.oauth2.credentials import Credentials
+            from google.auth.transport.requests import Request
+            from googleapiclient.discovery import build
+        except ImportError as exc:
+            raise OAuthSetupError("Google OAuth 패키지가 설치되어 있지 않습니다.") from exc
+        credentials = self._load_cached_credentials(config, Credentials, Request)
+        if not credentials or not credentials.valid:
+            return None
+        return build("youtube", "v3", credentials=credentials)
+
+    def build_youtube_service(self, write_access: bool = False) -> Any:
+        credentials = self.login(write_access=write_access)
+        try:
+            from googleapiclient.discovery import build
+        except ImportError as exc:
+            raise OAuthSetupError("google-api-python-client가 설치되어 있지 않습니다.") from exc
+        return build("youtube", "v3", credentials=credentials)
+
+    def _discover_config(self, write_access: bool) -> OAuthClientConfig:
+        scopes = list(DEFAULT_READ_SCOPES)
+        if write_access:
+            scopes = list(dict.fromkeys(scopes + DEFAULT_WRITE_SCOPES))
+        return OAuthClientConfig.discover(scopes)
+
+    def _load_cached_credentials(self, config: OAuthClientConfig, credentials_cls: Any, request_cls: Any) -> Any:
         credentials = None
         token_info = self.token_store.load()
         if token_info:
@@ -118,20 +167,8 @@ class OAuthManager:
             else:
                 granted = set(raw or [])
             if granted.issuperset(config.scopes):
-                credentials = Credentials.from_authorized_user_info(token_info, list(config.scopes))
+                credentials = credentials_cls.from_authorized_user_info(token_info, list(config.scopes))
         if credentials and credentials.expired and credentials.refresh_token:
-            credentials.refresh(Request())
-            self.token_store.save(json.loads(credentials.to_json()))
-        if not credentials or not credentials.valid:
-            flow = InstalledAppFlow.from_client_secrets_file(str(config.client_secret_path), list(config.scopes))
-            credentials = flow.run_local_server(host="127.0.0.1", port=0, open_browser=True)
+            credentials.refresh(request_cls())
             self.token_store.save(json.loads(credentials.to_json()))
         return credentials
-
-    def build_youtube_service(self, write_access: bool = False) -> Any:
-        credentials = self.login(write_access=write_access)
-        try:
-            from googleapiclient.discovery import build
-        except ImportError as exc:
-            raise OAuthSetupError("google-api-python-client가 설치되어 있지 않습니다.") from exc
-        return build("youtube", "v3", credentials=credentials)

@@ -45,7 +45,9 @@ class LocalUploadTests(unittest.TestCase):
                 outputs.append(target)
             return outputs
 
-        def default_uploader(youtube_client, *, title, description, tags, privacy_status, media_path):
+        def default_uploader(youtube_client, *, title, description, tags, privacy_status, media_path, progress_callback=None):
+            if progress_callback is not None:
+                progress_callback(1.0)
             return {"id": media_path.stem}
 
         return LocalUploadController(
@@ -105,10 +107,14 @@ class LocalUploadTests(unittest.TestCase):
     def test_queue_processing_continues_after_failure(self):
         uploaded_titles = []
 
-        def uploader(youtube_client, *, title, description, tags, privacy_status, media_path):
+        def uploader(youtube_client, *, title, description, tags, privacy_status, media_path, progress_callback=None):
             uploaded_titles.append(title)
+            if progress_callback is not None:
+                progress_callback(0.5)
             if "(2/3)" in title:
                 raise RuntimeError("두 번째 업로드 실패")
+            if progress_callback is not None:
+                progress_callback(1.0)
             return {"id": media_path.stem}
 
         controller = self._build_controller(uploader=uploader)
@@ -134,6 +140,38 @@ class LocalUploadTests(unittest.TestCase):
             "[젠존제] 세그먼트 테스트 - 2026-04-25 (3/3)",
         ])
         self.assertEqual([item.status for item in summary.items], ["uploaded", "failed", "uploaded"])
+
+    def test_queue_progress_callback_reports_overall_progress(self):
+        events = []
+
+        def uploader(youtube_client, *, title, description, tags, privacy_status, media_path, progress_callback=None):
+            if progress_callback is not None:
+                progress_callback(0.25)
+                progress_callback(1.0)
+            return {"id": media_path.stem}
+
+        controller = self._build_controller(uploader=uploader)
+        controller.load_source(self.video_path, ffprobe_path=Path("ffprobe"))
+        controller.rebuild_segments([60])
+        controller.update_common_metadata(
+            game_title_prefix="젠존제",
+            title_text="진행률 테스트",
+            date_text="2026-04-25",
+            description="설명",
+            tags=["#zenlesszonezero"],
+            privacy_status="private",
+        )
+        controller.overwrite_segment_defaults()
+        controller.build_queue()
+        controller.process_queue(
+            object(),
+            ffmpeg_path=Path("ffmpeg"),
+            output_dir=Path(self.tempdir.name) / "out",
+            progress_callback=lambda current, total, fraction, message: events.append((current, total, round(fraction, 2), message)),
+        )
+        self.assertTrue(events)
+        self.assertEqual(events[0][0:2], (1, 2))
+        self.assertEqual(events[-1][0:3], (2, 2, 1.0))
 
     def test_autosave_roundtrip_restores_selected_segment_and_position(self):
         controller = self._build_controller()

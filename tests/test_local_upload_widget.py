@@ -79,6 +79,11 @@ class LocalUploadWidgetTests(unittest.TestCase):
         self.app.processEvents()
         self.assertFalse(self.widget.is_text_input_focused())
 
+    def test_upload_progress_updates_widgets(self):
+        self.widget._on_upload_progress(1, 4, 0.5, "업로드 중 · 테스트")
+        self.assertEqual(self.widget.upload_progress_bar.value(), 12)
+        self.assertIn("업로드 중", self.widget.upload_progress_label.text())
+
 
 if __name__ == "__main__":
     unittest.main()

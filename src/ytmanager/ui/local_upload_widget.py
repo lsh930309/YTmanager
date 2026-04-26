@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from hashlib import sha1
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -9,6 +10,7 @@ from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -24,6 +26,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QProgressBar,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -369,10 +372,18 @@ class LocalUploadWidget(QWidget):
         queue_layout = QVBoxLayout(queue_group)
         self.queue_list = QListWidget()
         self.queue_list.setWordWrap(True)
-        upload_btn = QPushButton("큐 업로드 실행")
-        upload_btn.clicked.connect(self.upload_queue)
+        self.upload_progress_label = QLabel("업로드 대기")
+        self.upload_progress_label.setWordWrap(True)
+        self.upload_progress_bar = QProgressBar()
+        self.upload_progress_bar.setRange(0, 100)
+        self.upload_progress_bar.setValue(0)
+        self.upload_progress_bar.setFormat("%p%")
+        self.upload_queue_btn = QPushButton("큐 업로드 실행")
+        self.upload_queue_btn.clicked.connect(self.upload_queue)
         queue_layout.addWidget(self.queue_list, stretch=1)
-        queue_layout.addWidget(upload_btn)
+        queue_layout.addWidget(self.upload_progress_label)
+        queue_layout.addWidget(self.upload_progress_bar)
+        queue_layout.addWidget(self.upload_queue_btn)
         left_layout.addWidget(queue_group, stretch=1)
         root.addWidget(left)
 
@@ -999,11 +1010,19 @@ class LocalUploadWidget(QWidget):
             QMessageBox.warning(self, "ffmpeg 준비 실패", str(exc))
             return
         session = self.controller.require_session()
-        output_dir = user_cache_dir() / "local-upload-segments" / session.source_path.stem
+        output_dir = self._session_cache_dir("local-upload-segments", session.source_path)
+        self.upload_queue_btn.setEnabled(False)
+        self._set_upload_progress(0, "업로드를 시작합니다...")
         try:
             self.status_message("세그먼트 분할 및 업로드를 시작합니다...")
-            summary = self.controller.process_queue(youtube, ffmpeg_path=toolchain.ffmpeg_path, output_dir=output_dir)
+            summary = self.controller.process_queue(
+                youtube,
+                ffmpeg_path=toolchain.ffmpeg_path,
+                output_dir=output_dir,
+                progress_callback=self._on_upload_progress,
+            )
         except Exception as exc:
+            self.upload_queue_btn.setEnabled(True)
             QMessageBox.critical(self, "업로드 실패", str(exc))
             return
         self._populate_queue()
@@ -1011,6 +1030,11 @@ class LocalUploadWidget(QWidget):
             self.clear_saved_session()
         else:
             self.save_session_now(silent=True)
+        self.upload_queue_btn.setEnabled(True)
+        if summary.total > 0:
+            self._set_upload_progress(100, f"업로드 완료 · 성공 {summary.succeeded} / 실패 {summary.failed}")
+        else:
+            self._set_upload_progress(0, "업로드 대기")
         QMessageBox.information(self, "업로드 완료", f"성공 {summary.succeeded}개 / 실패 {summary.failed}개 / 전체 {summary.total}개")
         self.status_message(f"로컬 세그먼트 업로드 완료: 성공 {summary.succeeded}, 실패 {summary.failed}")
 
@@ -1052,7 +1076,7 @@ class LocalUploadWidget(QWidget):
         index = self._selected_segment_index or self.controller.active_segment_index(self.player.position() / 1000) or 1
         try:
             toolchain = self._ensure_toolchain()
-            output_dir = user_cache_dir() / "local-upload-thumbnails" / session.source_path.stem
+            output_dir = self._session_cache_dir("local-upload-thumbnails", session.source_path)
             output_path = output_dir / f"segment-{index:02d}.jpg"
             capture_video_frame(session.source_path, output_path, self.player.position() / 1000, toolchain.ffmpeg_path)
             self.controller.set_segment_thumbnail(index, output_path)
@@ -1105,6 +1129,25 @@ class LocalUploadWidget(QWidget):
             if int(item.data(Qt.UserRole) or 0) == index:
                 self.segment_card_list.setCurrentItem(item)
                 return
+
+    def _on_upload_progress(self, current_index: int, total: int, current_fraction: float, message: str) -> None:
+        if total <= 0:
+            self._set_upload_progress(0, message)
+            return
+        completed_before = max(0, current_index - 1)
+        overall_fraction = (completed_before + max(0.0, min(1.0, current_fraction))) / total
+        percent = int(round(overall_fraction * 100))
+        self._set_upload_progress(percent, f"{message} ({current_index}/{total})")
+        QApplication.processEvents()
+
+    def _set_upload_progress(self, percent: int, message: str) -> None:
+        self.upload_progress_bar.setValue(max(0, min(100, percent)))
+        self.upload_progress_label.setText(message)
+
+    @staticmethod
+    def _session_cache_dir(kind: str, source_path: Path) -> Path:
+        digest = sha1(str(source_path).encode("utf-8")).hexdigest()[:10]
+        return user_cache_dir() / kind / digest
 
     @staticmethod
     def _set_combo_data(combo: QComboBox, value: str) -> None:
