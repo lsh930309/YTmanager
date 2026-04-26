@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QCompleter,
     QDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSplitter,
+    QStackedWidget,
     QStatusBar,
     QToolBar,
     QTreeWidget,
@@ -47,6 +49,7 @@ from ytmanager.description import (
     select_template,
 )
 from ytmanager.ui.character_master_window import CharacterMasterWindow
+from ytmanager.ui.local_upload_widget import LocalUploadWidget
 from ytmanager.character_status import game_key_from_title_prefix, parse_party_status, format_party_status
 from ytmanager.migration import build_migration_candidates, build_normalized_description, candidate_to_draft_record, is_managed_title
 from ytmanager.models import TimestampEntry, VideoDraft, VideoSummary
@@ -523,10 +526,30 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         root = QWidget()
-        root_layout = QHBoxLayout(root)
+        root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(8, 8, 8, 8)
         root_layout.setSpacing(8)
         self.setCentralWidget(root)
+
+        workspace_row = QHBoxLayout()
+        workspace_row.addWidget(QLabel("작업 공간"))
+        self.metadata_workspace_btn = QRadioButton("YouTube 메타데이터")
+        self.local_workspace_btn = QRadioButton("로컬 업로드")
+        self.metadata_workspace_btn.setChecked(True)
+        self.metadata_workspace_btn.toggled.connect(lambda checked: self._set_workspace(0, checked))
+        self.local_workspace_btn.toggled.connect(lambda checked: self._set_workspace(1, checked))
+        workspace_row.addWidget(self.metadata_workspace_btn)
+        workspace_row.addWidget(self.local_workspace_btn)
+        workspace_row.addStretch(1)
+        root_layout.addLayout(workspace_row)
+
+        self.workspace_stack = QStackedWidget()
+        root_layout.addWidget(self.workspace_stack, stretch=1)
+
+        self.metadata_workspace = QWidget()
+        metadata_layout = QHBoxLayout(self.metadata_workspace)
+        metadata_layout.setContentsMargins(0, 0, 0, 0)
+        metadata_layout.setSpacing(8)
 
         # --- 왼쪽: 영상 목록 (단일 줄 + 아이콘 상태) ---
         left = QWidget()
@@ -580,10 +603,10 @@ class MainWindow(QMainWindow):
             "QPushButton:checked{background:#1565c0;color:white;font-weight:bold;}"
         )
         left_layout.addWidget(self.mode_toggle_btn)
-        root_layout.addWidget(left)
+        metadata_layout.addWidget(left)
 
         self.main_splitter = QSplitter(Qt.Horizontal)
-        root_layout.addWidget(self.main_splitter, stretch=1)
+        metadata_layout.addWidget(self.main_splitter, stretch=1)
 
         # --- 중앙: 재생기 + 타임스탬프 ---
         center = QWidget()
@@ -870,6 +893,16 @@ class MainWindow(QMainWindow):
         self.thumbnail_group.setVisible(False)
 
         self.setStatusBar(QStatusBar())
+        self.workspace_stack.addWidget(self.metadata_workspace)
+        self.local_upload_widget = LocalUploadWidget(
+            rules=self.rule_mappings,
+            settings_store=self.db,
+            ensure_youtube_client=self._ensure_youtube_client_for_local_upload,
+            status_message=lambda message: self.statusBar().showMessage(message),
+            parent=self,
+        )
+        self.workspace_stack.addWidget(self.local_upload_widget)
+
         self.statusBar().showMessage("준비됨")
         self._rebuild_field_form(self._selected_template_name(), {})
 
@@ -883,6 +916,20 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "로그인 설정 필요", str(exc))
         except Exception as exc:
             QMessageBox.critical(self, "로그인 실패", f"Google 로그인 중 오류가 발생했습니다.\n\n{exc}")
+
+    def _ensure_youtube_client_for_local_upload(self) -> Optional[YouTubeApiClient]:
+        if not self.youtube:
+            self.login()
+        return self.youtube
+
+    def _set_workspace(self, index: int, checked: bool) -> None:
+        if not checked:
+            return
+        self.workspace_stack.setCurrentIndex(index)
+        if index == 1:
+            self.statusBar().showMessage("로컬 업로드 작업 공간으로 전환했습니다.")
+        else:
+            self.statusBar().showMessage("YouTube 메타데이터 작업 공간으로 전환했습니다.")
 
     def sync_videos(self) -> None:
         if not self.youtube:
@@ -1356,6 +1403,8 @@ class MainWindow(QMainWindow):
             self._player_shortcuts.append(shortcut)
 
     def _run_player_shortcut(self, action: Callable[[], None]) -> None:
+        if hasattr(self, "workspace_stack") and self.workspace_stack.currentIndex() != 0:
+            return
         if not self.current_video or self._player_shortcut_blocked():
             return
         action()

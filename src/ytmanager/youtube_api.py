@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 from ytmanager.models import VideoSummary
 from ytmanager.thumbnail import validate_thumbnail_file
@@ -126,10 +126,63 @@ class YouTubeApiClient:
         snippet.setdefault("categoryId", "22")
         return {"id": video_id, "snippet": snippet}
 
+    @staticmethod
+    def build_video_insert_payload(
+        *,
+        title: str,
+        description: str,
+        tags: Sequence[str],
+        privacy_status: str,
+        category_id: str = "22",
+    ) -> dict[str, Any]:
+        if not title.strip():
+            raise ValueError("업로드 제목은 비어 있을 수 없습니다.")
+        return {
+            "snippet": {
+                "title": title.strip(),
+                "description": description,
+                "tags": list(tags),
+                "categoryId": category_id,
+            },
+            "status": {
+                "privacyStatus": privacy_status,
+            },
+        }
+
     def update_video_snippet(self, video_id: str, title: str, description: str, tags: list[str]) -> Mapping[str, Any]:
         existing = self.get_video_resource(video_id)
         body = self.build_snippet_update_payload(existing, title=title, description=description, tags=tags)
         return self.service.videos().update(part="snippet", body=body).execute()
+
+    def upload_video(
+        self,
+        *,
+        title: str,
+        description: str,
+        tags: Sequence[str],
+        privacy_status: str,
+        media_path: Path,
+        category_id: str = "22",
+    ) -> Mapping[str, Any]:
+        if not media_path.exists():
+            raise YouTubeApiError(f"업로드할 영상 파일을 찾을 수 없습니다: {media_path}")
+        try:
+            from googleapiclient.http import MediaFileUpload
+        except ImportError as exc:
+            raise YouTubeApiError("google-api-python-client가 설치되어 있지 않습니다.") from exc
+        body = self.build_video_insert_payload(
+            title=title,
+            description=description,
+            tags=tags,
+            privacy_status=privacy_status,
+            category_id=category_id,
+        )
+        media = MediaFileUpload(str(media_path), resumable=True)
+        request = self.service.videos().insert(part="snippet,status", body=body, media_body=media)
+        response = None
+        while response is None:
+            _status, response = request.next_chunk()
+        return response
 
     def upload_thumbnail(self, video_id: str, image_path: Path) -> Mapping[str, Any]:
         validation = validate_thumbnail_file(image_path)

@@ -46,6 +46,12 @@ CREATE TABLE IF NOT EXISTS metadata_snapshots (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS description_drafts (
     video_id TEXT PRIMARY KEY,
     template_name TEXT NOT NULL,
@@ -267,6 +273,26 @@ class AppDatabase:
 
     def close(self) -> None:
         self.connection.close()
+
+    def get_setting(self, key: str, default: str = "") -> str:
+        row = self.connection.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return default
+        return str(row["value"])
+
+    def set_setting(self, key: str, value: str) -> None:
+        now = utc_now_iso()
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, value, now),
+            )
 
     def save_videos(self, videos: Iterable[VideoSummary]) -> None:
         with self.connection:

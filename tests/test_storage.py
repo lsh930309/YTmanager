@@ -86,6 +86,19 @@ class StorageTests(unittest.TestCase):
             finally:
                 db.close()
 
+
+    def test_app_settings_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = AppDatabase(Path(tmp) / "app.sqlite3")
+            try:
+                self.assertEqual(db.get_setting("missing", "default"), "default")
+                db.set_setting("last_media_dir", "/tmp/media")
+                db.set_setting("ffmpeg_version", "ffmpeg version 8.1")
+                self.assertEqual(db.get_setting("last_media_dir"), "/tmp/media")
+                self.assertEqual(db.get_setting("ffmpeg_version"), "ffmpeg version 8.1")
+            finally:
+                db.close()
+
     def test_character_roster_observation_uses_highest_progression(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = AppDatabase(Path(tmp) / "app.sqlite3")
