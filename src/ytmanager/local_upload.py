@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from time import perf_counter
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol, Sequence
 
 from ytmanager.models import RuleMapping
-from ytmanager.rules import unique_tags
+from ytmanager.rules import merge_top_tags, unique_tags
 
 QUEUE_STATUS_PENDING = "pending"
 QUEUE_STATUS_PROCESSING = "processing"
@@ -119,6 +120,12 @@ class UploadQueueItem:
     output_path: Path | None = None
     uploaded_video_id: str = ""
     error_message: str = ""
+    warning_message: str = ""
+    upload_size_bytes: int = 0
+    upload_elapsed_seconds: float = 0.0
+    upload_speed_mib_per_second: float = 0.0
+    upload_strategy: str = ""
+    thumbnail_uploaded: bool = False
 
 
 @dataclass
@@ -127,6 +134,13 @@ class UploadProcessSummary:
     succeeded: int
     failed: int
     items: list[UploadQueueItem] = field(default_factory=list)
+    upload_elapsed_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class PreparedUploadMetadata:
+    description: str
+    tags: list[str]
 
 
 ProgressCallback = Callable[[int, int, float, str], None]
@@ -426,9 +440,16 @@ class LocalUploadController:
         succeeded = 0
         failed = 0
         total = len(self.queue)
+        upload_started_at = perf_counter()
         for position, item in enumerate(self.queue, start=1):
             item.status = QUEUE_STATUS_PROCESSING
             item.error_message = ""
+            item.warning_message = ""
+            item.upload_size_bytes = 0
+            item.upload_elapsed_seconds = 0.0
+            item.upload_speed_mib_per_second = 0.0
+            item.upload_strategy = ""
+            item.thumbnail_uploaded = False
             if item.output_path is None or not Path(item.output_path).exists():
                 item.status = QUEUE_STATUS_FAILED
                 item.error_message = "업로드할 분할 파일이 준비되지 않았습니다."
@@ -437,36 +458,101 @@ class LocalUploadController:
                     progress_callback(position, total, 1.0, f"업로드 실패 · {item.segment.title}")
                 continue
             try:
+                metadata = prepare_upload_metadata(item.segment.description, item.segment.tags)
+                item.upload_size_bytes = Path(item.output_path).stat().st_size
+                item_upload_started_at = perf_counter()
+
+                def upload_progress(fraction: float, *, position: int = position, total: int = total, title: str = item.segment.title, queue_item: UploadQueueItem = item) -> None:
+                    if progress_callback is None:
+                        return
+                    clamped_fraction = max(0.0, min(1.0, fraction))
+                    elapsed = max(perf_counter() - item_upload_started_at, 1e-9)
+                    queue_item.upload_elapsed_seconds = elapsed
+                    transferred_mib = (queue_item.upload_size_bytes * clamped_fraction) / (1024 * 1024)
+                    queue_item.upload_speed_mib_per_second = transferred_mib / elapsed if clamped_fraction > 0 else 0.0
+                    progress_callback(
+                        position,
+                        total,
+                        clamped_fraction,
+                        build_upload_progress_message(
+                            "업로드 중",
+                            title,
+                            speed_mib_per_second=queue_item.upload_speed_mib_per_second,
+                        ),
+                    )
+
                 response = self.uploader(
                     youtube_client,
                     title=item.segment.title,
-                    description=item.segment.description,
-                    tags=item.segment.tags,
+                    description=metadata.description,
+                    tags=metadata.tags,
                     privacy_status=item.segment.privacy_status,
                     media_path=item.output_path,
-                    progress_callback=(
-                        None
-                        if progress_callback is None
-                        else lambda fraction, position=position, total=total, title=item.segment.title: progress_callback(
+                    progress_callback=upload_progress if progress_callback is not None else None,
+                )
+                item.upload_elapsed_seconds = max(perf_counter() - item_upload_started_at, 0.0)
+                item.uploaded_video_id = str(response.get("id", ""))
+                metrics = extract_upload_metrics(response)
+                if metrics:
+                    item.upload_size_bytes = int(metrics.get("file_size_bytes", item.upload_size_bytes) or item.upload_size_bytes)
+                    item.upload_elapsed_seconds = float(metrics.get("elapsed_seconds", item.upload_elapsed_seconds) or item.upload_elapsed_seconds)
+                    item.upload_speed_mib_per_second = float(metrics.get("speed_mib_per_second", item.upload_speed_mib_per_second) or item.upload_speed_mib_per_second)
+                    item.upload_strategy = str(metrics.get("strategy", "") or "")
+                item.status = QUEUE_STATUS_UPLOADED
+                if item.segment.thumbnail_path and item.uploaded_video_id:
+                    if progress_callback is not None:
+                        progress_callback(
                             position,
                             total,
-                            max(0.0, min(1.0, fraction)),
-                            f"업로드 중 · {title}",
+                            1.0,
+                            build_upload_progress_message("썸네일 업로드 중", item.segment.title),
                         )
-                    ),
-                )
-                item.uploaded_video_id = str(response.get("id", ""))
-                item.status = QUEUE_STATUS_UPLOADED
+                    thumbnail_path = Path(item.segment.thumbnail_path)
+                    try:
+                        youtube_client.upload_thumbnail(item.uploaded_video_id, thumbnail_path)
+                        item.thumbnail_uploaded = True
+                        if progress_callback is not None:
+                            progress_callback(
+                                position,
+                                total,
+                                1.0,
+                                build_upload_progress_message("썸네일 완료", item.segment.title),
+                            )
+                    except Exception as exc:
+                        item.warning_message = f"썸네일 업로드 실패: {exc}"
+                        if progress_callback is not None:
+                            progress_callback(
+                                position,
+                                total,
+                                1.0,
+                                build_upload_progress_message("썸네일 경고", item.segment.title, warning=item.warning_message),
+                            )
                 succeeded += 1
                 if progress_callback is not None:
-                    progress_callback(position, total, 1.0, f"업로드 완료 · {item.segment.title}")
+                    progress_callback(
+                        position,
+                        total,
+                        1.0,
+                        build_upload_progress_message(
+                            "업로드 완료",
+                            item.segment.title,
+                            speed_mib_per_second=item.upload_speed_mib_per_second,
+                            warning=item.warning_message or None,
+                        ),
+                    )
             except Exception as exc:
                 item.status = QUEUE_STATUS_FAILED
                 item.error_message = str(exc)
                 failed += 1
                 if progress_callback is not None:
                     progress_callback(position, total, 1.0, f"업로드 실패 · {item.segment.title}")
-        return UploadProcessSummary(total=len(self.queue), succeeded=succeeded, failed=failed, items=list(self.queue))
+        return UploadProcessSummary(
+            total=len(self.queue),
+            succeeded=succeeded,
+            failed=failed,
+            items=list(self.queue),
+            upload_elapsed_seconds=max(perf_counter() - upload_started_at, 0.0),
+        )
 
     def active_segment_index(self, seconds: float) -> int | None:
         session = self.require_session()
@@ -630,6 +716,36 @@ def upload_local_video_segment(
         media_path=media_path,
         progress_callback=progress_callback,
     )
+
+
+def prepare_upload_metadata(description: str, tags: Sequence[str]) -> PreparedUploadMetadata:
+    normalized_tags = unique_tags(tags)
+    return PreparedUploadMetadata(
+        description=merge_top_tags(description, normalized_tags),
+        tags=normalized_tags,
+    )
+
+
+def build_upload_progress_message(
+    stage: str,
+    title: str,
+    *,
+    speed_mib_per_second: float | None = None,
+    warning: str | None = None,
+) -> str:
+    parts = [stage, title]
+    if speed_mib_per_second is not None and speed_mib_per_second > 0:
+        parts.append(f"{speed_mib_per_second:.1f} MiB/s")
+    if warning:
+        parts.append(warning)
+    return " · ".join(parts)
+
+
+def extract_upload_metrics(response: Any) -> dict[str, Any]:
+    if not isinstance(response, dict):
+        return {}
+    metrics = response.get("_ytmanager_upload_metrics")
+    return metrics if isinstance(metrics, dict) else {}
 
 
 def _safe_float(value: Any) -> float:

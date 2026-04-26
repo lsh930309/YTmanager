@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from ytmanager.models import VideoSummary
@@ -13,6 +15,13 @@ DEFAULT_READ_SCOPES = [YOUTUBE_READONLY_SCOPE]
 DEFAULT_WRITE_SCOPES = [YOUTUBE_MANAGE_SCOPE, YOUTUBE_UPLOAD_SCOPE]
 VIDEO_LIST_PARTS = "snippet,contentDetails,status"
 VIDEO_LIST_PARTS_WITH_FILE_DETAILS = f"{VIDEO_LIST_PARTS},fileDetails"
+FALLBACK_RESUMABLE_CHUNK_SIZE = 32 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class UploadStrategy:
+    name: str
+    chunksize: int
 
 
 class YouTubeApiError(RuntimeError):
@@ -167,10 +176,6 @@ class YouTubeApiClient:
     ) -> Mapping[str, Any]:
         if not media_path.exists():
             raise YouTubeApiError(f"업로드할 영상 파일을 찾을 수 없습니다: {media_path}")
-        try:
-            from googleapiclient.http import MediaFileUpload
-        except ImportError as exc:
-            raise YouTubeApiError("google-api-python-client가 설치되어 있지 않습니다.") from exc
         body = self.build_video_insert_payload(
             title=title,
             description=description,
@@ -178,9 +183,44 @@ class YouTubeApiClient:
             privacy_status=privacy_status,
             category_id=category_id,
         )
-        media = MediaFileUpload(str(media_path), resumable=True)
-        request = self.service.videos().insert(part="snippet,status", body=body, media_body=media)
+        last_error: Exception | None = None
+        for strategy in self.default_upload_strategies():
+            try:
+                return self._upload_video_with_strategy(
+                    body=body,
+                    media_path=media_path,
+                    strategy=strategy,
+                    progress_callback=progress_callback,
+                )
+            except Exception as exc:
+                last_error = exc
+        if last_error is None:
+            raise YouTubeApiError("업로드 전략을 초기화하지 못했습니다.")
+        raise last_error
+
+    @staticmethod
+    def default_upload_strategies() -> tuple[UploadStrategy, ...]:
+        return (
+            UploadStrategy(name="single_chunk_resumable", chunksize=-1),
+            UploadStrategy(name="chunked_resumable_fallback", chunksize=FALLBACK_RESUMABLE_CHUNK_SIZE),
+        )
+
+    def _upload_video_with_strategy(
+        self,
+        *,
+        body: Mapping[str, Any],
+        media_path: Path,
+        strategy: UploadStrategy,
+        progress_callback: Callable[[float], None] | None = None,
+    ) -> Mapping[str, Any]:
+        try:
+            from googleapiclient.http import MediaFileUpload
+        except ImportError as exc:
+            raise YouTubeApiError("google-api-python-client가 설치되어 있지 않습니다.") from exc
+        media = MediaFileUpload(str(media_path), resumable=True, chunksize=strategy.chunksize)
+        request = self.service.videos().insert(part="snippet,status", body=dict(body), media_body=media)
         response = None
+        started_at = perf_counter()
         if progress_callback is not None:
             progress_callback(0.0)
         while response is None:
@@ -190,9 +230,19 @@ class YouTubeApiClient:
                     progress_callback(max(0.0, min(1.0, float(status.progress()))))
                 except Exception:
                     pass
+        elapsed = max(perf_counter() - started_at, 0.0)
         if progress_callback is not None:
             progress_callback(1.0)
-        return response
+        payload = dict(response)
+        file_size_bytes = media_path.stat().st_size
+        payload["_ytmanager_upload_metrics"] = {
+            "strategy": strategy.name,
+            "chunksize": strategy.chunksize,
+            "file_size_bytes": file_size_bytes,
+            "elapsed_seconds": elapsed,
+            "speed_mib_per_second": ((file_size_bytes / (1024 * 1024)) / elapsed) if elapsed > 0 else 0.0,
+        }
+        return payload
 
     def upload_thumbnail(self, video_id: str, image_path: Path) -> Mapping[str, Any]:
         validation = validate_thumbnail_file(image_path)

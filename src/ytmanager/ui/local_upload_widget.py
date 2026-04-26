@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from hashlib import sha1
 from pathlib import Path
+from time import perf_counter
 from typing import Callable, Optional
 import shutil
 
@@ -357,6 +358,7 @@ class LocalUploadWidget(QWidget):
         self.upload_worker: QueueUploadWorker | None = None
         self.pending_upload_output_dir: Path | None = None
         self.pending_upload_source_path: Path | None = None
+        self._upload_started_at: float | None = None
 
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
@@ -796,6 +798,8 @@ class LocalUploadWidget(QWidget):
             line = f"[{label}] {item.segment.title}"
             if item.error_message:
                 line = f"{line}\n{item.error_message}"
+            elif item.warning_message:
+                line = f"{line}\n{item.warning_message}"
             self.queue_list.addItem(line)
 
     def _sync_timeline_state(self, *, current_seconds: float | None = None) -> None:
@@ -848,6 +852,8 @@ class LocalUploadWidget(QWidget):
         if self.controller.session is None:
             QMessageBox.information(self, "세션 필요", "먼저 로컬 영상을 선택하세요.")
             return
+        if self._segment_editor_dirty:
+            self._apply_segment_editor_changes(silent=True)
         self.controller.update_common_metadata(
             game_title_prefix=str(self.game_combo.currentData() or ""),
             title_text=self.title_input.text(),
@@ -861,6 +867,8 @@ class LocalUploadWidget(QWidget):
         self._refresh_session_labels()
         self._refresh_all_segment_card_widgets()
         self._populate_queue()
+        if self._selected_segment_index is not None:
+            self._populate_segment_editor(self.controller.require_segment(self._selected_segment_index))
         self._sync_timeline_state()
         self._schedule_autosave()
         self.status_message("공통 메타데이터를 세그먼트 초안에 복제했습니다.")
@@ -1111,7 +1119,9 @@ class LocalUploadWidget(QWidget):
         youtube = self.ensure_youtube_client()
         if youtube is None:
             self._set_upload_controls_busy(False)
+            self._upload_started_at = None
             return
+        self._upload_started_at = perf_counter()
         self.upload_worker = QueueUploadWorker(self.controller, youtube, self)
         self.upload_worker.progress.connect(self._on_upload_progress)
         self.upload_worker.completed.connect(self._on_upload_completed)
@@ -1146,16 +1156,25 @@ class LocalUploadWidget(QWidget):
                 self.refresh_uploaded_videos()
             except Exception as exc:
                 QMessageBox.warning(self, "채널 동기화 실패", f"업로드 후 영상 목록을 새로고침하지 못했습니다.\n\n{exc}")
+        upload_elapsed = float(getattr(summary, "upload_elapsed_seconds", 0.0) or 0.0)
+        total_elapsed = max(perf_counter() - self._upload_started_at, 0.0) if self._upload_started_at is not None else upload_elapsed
+        self._upload_started_at = None
         if summary.total > 0:
-            self._set_upload_progress(100, f"업로드 완료 · 성공 {summary.succeeded} / 실패 {summary.failed}")
+            self._set_upload_progress(
+                100,
+                f"업로드 완료 · 성공 {summary.succeeded} / 실패 {summary.failed} · 업로드 {upload_elapsed:.1f}s / 전체 {total_elapsed:.1f}s",
+            )
         else:
             self._set_upload_progress(0, "업로드 대기")
         QMessageBox.information(self, "업로드 완료", f"성공 {summary.succeeded}개 / 실패 {summary.failed}개 / 전체 {summary.total}개")
-        self.status_message(f"로컬 세그먼트 업로드 완료: 성공 {summary.succeeded}, 실패 {summary.failed}")
+        self.status_message(
+            f"로컬 세그먼트 업로드 완료: 성공 {summary.succeeded}, 실패 {summary.failed}, 업로드 {upload_elapsed:.1f}s, 전체 {total_elapsed:.1f}s"
+        )
 
     def _on_worker_failed(self, message: str) -> None:
         self._set_upload_controls_busy(False)
         self._set_upload_progress(0, "업로드 대기")
+        self._upload_started_at = None
         QMessageBox.critical(self, "업로드 실패", message)
 
     def _on_split_worker_finished(self) -> None:

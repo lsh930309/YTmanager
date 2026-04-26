@@ -84,6 +84,31 @@ class LocalUploadWidgetTests(unittest.TestCase):
         self.assertEqual(self.widget.upload_progress_bar.value(), 56)
         self.assertIn("업로드 중", self.widget.upload_progress_label.text())
 
+    def test_apply_common_metadata_refreshes_selected_editor_and_queue(self):
+        self.widget.controller.rebuild_segments([60.0])
+        self.widget.controller.build_queue()
+        self.widget._rebuild_segment_cards(selected_index=2)
+        self.widget.title_input.setText("공통 제목")
+        self.widget.date_input.setText("2026-04-26")
+        self.widget.tags_input.setText("#zenlesszonezero #boss")
+        self.widget.description_input.setPlainText("공통 설명")
+        self.widget.segment_title_input.setText("임시 수정")
+        self.app.processEvents()
+        self.assertEqual(self.widget.segment_dirty_label.text(), "적용 대기")
+
+        self.widget.apply_common_metadata_to_segments()
+        self.app.processEvents()
+
+        expected_title = "[젠존제] 공통 제목 - 2026-04-26 (2/2)"
+        self.assertEqual(self.widget.controller.require_segment(2).title, expected_title)
+        self.assertEqual(self.widget.segment_title_input.text(), expected_title)
+        self.assertEqual(self.widget.segment_tags_input.text(), "#zenlesszonezero #boss")
+        self.assertEqual(self.widget.segment_description_input.toPlainText(), "공통 설명")
+        self.assertEqual(self.widget.segment_dirty_label.text(), "변경 없음")
+        self.assertIn(expected_title, self.widget.queue_list.item(1).text())
+        self.assertEqual(self.widget.timeline_widget.selected_index, 2)
+        self.assertEqual(self.widget.timeline_widget.segments[1].title, expected_title)
+
 
 if __name__ == "__main__":
     unittest.main()

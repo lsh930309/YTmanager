@@ -7,10 +7,12 @@ from ytmanager.local_upload import (
     LocalUploadController,
     LocalVideoProbe,
     build_segment_title,
+    prepare_upload_metadata,
     normalize_cut_points,
 )
 from ytmanager.models import RuleMapping
 from ytmanager.storage import AppDatabase
+from ytmanager.youtube_api import FALLBACK_RESUMABLE_CHUNK_SIZE, UploadStrategy, YouTubeApiClient
 
 
 class LocalUploadTests(unittest.TestCase):
@@ -104,6 +106,16 @@ class LocalUploadTests(unittest.TestCase):
         self.assertEqual(controller.require_segment(2).title, "[젠존제] 위험한 강습전 - 2026-04-25 후반")
         self.assertEqual(controller.require_segment(2).tags, ["#custom"])
 
+    def test_prepare_upload_metadata_merges_top_tags_once(self):
+        metadata = prepare_upload_metadata("본문", ["#zenlesszonezero", "boss", "#zenlesszonezero"])
+        self.assertEqual(metadata.tags, ["#zenlesszonezero", "#boss"])
+        self.assertEqual(metadata.description, "#zenlesszonezero #boss\n본문")
+
+    def test_prepare_upload_metadata_preserves_existing_first_line_tags(self):
+        metadata = prepare_upload_metadata("#zenlesszonezero\n본문", ["#zenlesszonezero"])
+        self.assertEqual(metadata.tags, ["#zenlesszonezero"])
+        self.assertEqual(metadata.description, "#zenlesszonezero\n본문")
+
     def test_queue_processing_continues_after_failure(self):
         uploaded_titles = []
 
@@ -177,6 +189,72 @@ class LocalUploadTests(unittest.TestCase):
         self.assertEqual(events[0][0:2], (1, 2))
         self.assertEqual(events[-1][0:3], (2, 2, 1.0))
 
+    def test_thumbnail_upload_warning_does_not_fail_video_upload(self):
+        class StubYouTubeClient:
+            def __init__(self) -> None:
+                self.thumbnail_calls = []
+
+            def upload_thumbnail(self, video_id, image_path):
+                self.thumbnail_calls.append((video_id, Path(image_path)))
+                raise RuntimeError("썸네일 오류")
+
+        events = []
+
+        def uploader(youtube_client, *, title, description, tags, privacy_status, media_path, progress_callback=None):
+            if progress_callback is not None:
+                progress_callback(0.5)
+                progress_callback(1.0)
+            return {"id": f"video-{media_path.stem}"}
+
+        controller = self._build_controller(uploader=uploader)
+        controller.load_source(self.video_path, ffprobe_path=Path("ffprobe"))
+        thumb_path = Path(self.tempdir.name) / "thumb.jpg"
+        thumb_path.write_bytes(b"jpg")
+        controller.set_segment_thumbnail(1, thumb_path)
+        controller.build_queue()
+        controller.prepare_queue_files(ffmpeg_path=Path("ffmpeg"), output_dir=Path(self.tempdir.name) / "out")
+
+        youtube_client = StubYouTubeClient()
+        summary = controller.upload_prepared_queue(
+            youtube_client,
+            progress_callback=lambda current, total, fraction, message: events.append((current, total, round(fraction, 2), message)),
+        )
+
+        self.assertEqual(summary.succeeded, 1)
+        self.assertEqual(summary.failed, 0)
+        self.assertEqual(len(youtube_client.thumbnail_calls), 1)
+        self.assertIn("썸네일 업로드 실패", summary.items[0].warning_message)
+        self.assertEqual(summary.items[0].status, "uploaded")
+        self.assertTrue(any("썸네일 업로드 중" in message for _, _, _, message in events))
+        self.assertTrue(any("썸네일 경고" in message for _, _, _, message in events))
+
+    def test_thumbnail_upload_success_marks_queue_item(self):
+        class StubYouTubeClient:
+            def __init__(self) -> None:
+                self.thumbnail_calls = []
+
+            def upload_thumbnail(self, video_id, image_path):
+                self.thumbnail_calls.append((video_id, Path(image_path)))
+                return {"items": []}
+
+        def uploader(youtube_client, *, title, description, tags, privacy_status, media_path, progress_callback=None):
+            return {"id": "video-1"}
+
+        controller = self._build_controller(uploader=uploader)
+        controller.load_source(self.video_path, ffprobe_path=Path("ffprobe"))
+        thumb_path = Path(self.tempdir.name) / "thumb.jpg"
+        thumb_path.write_bytes(b"jpg")
+        controller.set_segment_thumbnail(1, thumb_path)
+        controller.build_queue()
+        controller.prepare_queue_files(ffmpeg_path=Path("ffmpeg"), output_dir=Path(self.tempdir.name) / "out")
+
+        youtube_client = StubYouTubeClient()
+        summary = controller.upload_prepared_queue(youtube_client)
+
+        self.assertEqual(len(youtube_client.thumbnail_calls), 1)
+        self.assertTrue(summary.items[0].thumbnail_uploaded)
+        self.assertEqual(summary.items[0].warning_message, "")
+
     def test_autosave_roundtrip_restores_selected_segment_and_position(self):
         controller = self._build_controller()
         controller.load_source(self.video_path, ffprobe_path=Path("ffprobe"))
@@ -204,6 +282,45 @@ class LocalUploadTests(unittest.TestCase):
     def test_effective_frame_rate_falls_back_to_default(self):
         probe = LocalVideoProbe(duration_seconds=1.0, frame_rate=0.0)
         self.assertEqual(probe.effective_frame_rate(), DEFAULT_FRAME_RATE)
+
+
+class YouTubeUploadStrategyTests(unittest.TestCase):
+    def test_default_upload_strategies_prefer_single_chunk_then_fallback(self):
+        strategies = YouTubeApiClient.default_upload_strategies()
+        self.assertEqual(
+            strategies,
+            (
+                UploadStrategy(name="single_chunk_resumable", chunksize=-1),
+                UploadStrategy(name="chunked_resumable_fallback", chunksize=FALLBACK_RESUMABLE_CHUNK_SIZE),
+            ),
+        )
+
+    def test_upload_video_retries_with_fallback_strategy(self):
+        class StrategyClient(YouTubeApiClient):
+            def __init__(self) -> None:
+                super().__init__(service=object())
+                self.calls = []
+
+            def _upload_video_with_strategy(self, *, body, media_path, strategy, progress_callback=None):
+                self.calls.append(strategy)
+                if strategy.chunksize == -1:
+                    raise RuntimeError("single chunk failed")
+                return {"id": "uploaded", "_ytmanager_upload_metrics": {"strategy": strategy.name}}
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            media_path = Path(tempdir) / "video.mp4"
+            media_path.write_bytes(b"video")
+            client = StrategyClient()
+            response = client.upload_video(
+                title="제목",
+                description="설명",
+                tags=["#tag"],
+                privacy_status="private",
+                media_path=media_path,
+            )
+
+        self.assertEqual(response["id"], "uploaded")
+        self.assertEqual([strategy.chunksize for strategy in client.calls], [-1, FALLBACK_RESUMABLE_CHUNK_SIZE])
 
 
 if __name__ == "__main__":
