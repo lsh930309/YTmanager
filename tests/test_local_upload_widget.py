@@ -81,7 +81,7 @@ class LocalUploadWidgetTests(unittest.TestCase):
 
     def test_upload_progress_updates_widgets(self):
         self.widget._on_upload_progress(1, 4, 0.5, "업로드 중 · 테스트")
-        self.assertEqual(self.widget.upload_progress_bar.value(), 12)
+        self.assertEqual(self.widget.upload_progress_bar.value(), 56)
         self.assertIn("업로드 중", self.widget.upload_progress_label.text())
 
 

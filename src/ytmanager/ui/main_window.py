@@ -900,6 +900,7 @@ class MainWindow(QMainWindow):
             settings_store=self.db,
             ensure_youtube_client=self._ensure_youtube_client_for_local_upload,
             status_message=lambda message: self.statusBar().showMessage(message),
+            refresh_uploaded_videos=self.sync_videos,
             parent=self,
         )
         self.workspace_stack.addWidget(self.local_upload_widget)

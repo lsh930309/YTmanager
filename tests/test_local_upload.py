@@ -130,7 +130,8 @@ class LocalUploadTests(unittest.TestCase):
         )
         controller.overwrite_segment_defaults()
         controller.build_queue()
-        summary = controller.process_queue(object(), ffmpeg_path=Path("ffmpeg"), output_dir=Path(self.tempdir.name) / "out")
+        controller.prepare_queue_files(ffmpeg_path=Path("ffmpeg"), output_dir=Path(self.tempdir.name) / "out")
+        summary = controller.upload_prepared_queue(object())
         self.assertEqual(summary.total, 3)
         self.assertEqual(summary.succeeded, 2)
         self.assertEqual(summary.failed, 1)
@@ -163,10 +164,13 @@ class LocalUploadTests(unittest.TestCase):
         )
         controller.overwrite_segment_defaults()
         controller.build_queue()
-        controller.process_queue(
-            object(),
+        controller.prepare_queue_files(
             ffmpeg_path=Path("ffmpeg"),
             output_dir=Path(self.tempdir.name) / "out",
+            progress_callback=lambda current, total, fraction, message: events.append((current, total, round(fraction, 2), message)),
+        )
+        controller.upload_prepared_queue(
+            object(),
             progress_callback=lambda current, total, fraction, message: events.append((current, total, round(fraction, 2), message)),
         )
         self.assertTrue(events)

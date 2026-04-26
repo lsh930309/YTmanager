@@ -4,8 +4,9 @@ from datetime import datetime
 from hashlib import sha1
 from pathlib import Path
 from typing import Callable, Optional
+import shutil
 
-from PySide6.QtCore import QSignalBlocker, QSize, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QFile, QSignalBlocker, QSize, QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -58,6 +59,52 @@ CARD_THUMB_WIDTH = 160
 CARD_THUMB_HEIGHT = 90
 AUTOSAVE_DEBOUNCE_MS = 400
 TIMELINE_HEIGHT = 56
+
+
+class QueueSplitWorker(QThread):
+    progress = Signal(int, int, float, str)
+    completed = Signal(int)
+    failed = Signal(str)
+
+    def __init__(self, controller: LocalUploadController, ffmpeg_path: Path, output_dir: Path, source_path: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.controller = controller
+        self.ffmpeg_path = ffmpeg_path
+        self.output_dir = output_dir
+        self.source_path = source_path
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            prepared = self.controller.prepare_queue_files(
+                ffmpeg_path=self.ffmpeg_path,
+                output_dir=self.output_dir,
+                source_path=self.source_path,
+                progress_callback=lambda current, total, fraction, message: self.progress.emit(current, total, fraction, message),
+            )
+            self.completed.emit(len(prepared))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class QueueUploadWorker(QThread):
+    progress = Signal(int, int, float, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, controller: LocalUploadController, youtube_client: YouTubeApiClient, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.controller = controller
+        self.youtube_client = youtube_client
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            summary = self.controller.upload_prepared_queue(
+                self.youtube_client,
+                progress_callback=lambda current, total, fraction, message: self.progress.emit(current, total, fraction, message),
+            )
+            self.completed.emit(summary)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class AspectRatioVideoFrame(QWidget):
@@ -283,6 +330,7 @@ class LocalUploadWidget(QWidget):
         settings_store,
         ensure_youtube_client: Callable[[], Optional[YouTubeApiClient]],
         status_message: Callable[[str], None],
+        refresh_uploaded_videos: Callable[[], None] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -290,6 +338,7 @@ class LocalUploadWidget(QWidget):
         self.settings_store = settings_store
         self.ensure_youtube_client = ensure_youtube_client
         self.status_message = status_message
+        self.refresh_uploaded_videos = refresh_uploaded_videos
         self.controller = LocalUploadController(
             rules,
             settings_store,
@@ -304,6 +353,10 @@ class LocalUploadWidget(QWidget):
         self._scrub_resume_playback = False
         self.restored_session_loaded = False
         self._segment_editor_dirty = False
+        self.split_worker: QueueSplitWorker | None = None
+        self.upload_worker: QueueUploadWorker | None = None
+        self.pending_upload_output_dir: Path | None = None
+        self.pending_upload_source_path: Path | None = None
 
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
@@ -993,6 +1046,9 @@ class LocalUploadWidget(QWidget):
         if self.controller.session is None:
             QMessageBox.information(self, "세션 필요", "먼저 로컬 영상을 선택하세요.")
             return
+        if (self.split_worker and self.split_worker.isRunning()) or (self.upload_worker and self.upload_worker.isRunning()):
+            QMessageBox.information(self, "업로드 진행 중", "이미 로컬 업로드 작업이 진행 중입니다.")
+            return
         if self._segment_editor_dirty:
             self._apply_segment_editor_changes(silent=True)
         if not self.controller.queue:
@@ -1011,32 +1067,126 @@ class LocalUploadWidget(QWidget):
             return
         session = self.controller.require_session()
         output_dir = self._session_cache_dir("local-upload-segments", session.source_path)
-        self.upload_queue_btn.setEnabled(False)
-        self._set_upload_progress(0, "업로드를 시작합니다...")
-        try:
-            self.status_message("세그먼트 분할 및 업로드를 시작합니다...")
-            summary = self.controller.process_queue(
-                youtube,
-                ffmpeg_path=toolchain.ffmpeg_path,
-                output_dir=output_dir,
-                progress_callback=self._on_upload_progress,
+        shutil.rmtree(output_dir, ignore_errors=True)
+        self.pending_upload_output_dir = output_dir
+        self.pending_upload_source_path = session.source_path
+        self._set_upload_controls_busy(True)
+        self._set_upload_progress(0, "세그먼트 분할을 시작합니다...")
+        self.status_message("세그먼트 분할을 시작합니다...")
+        self.split_worker = QueueSplitWorker(self.controller, toolchain.ffmpeg_path, output_dir, session.source_path, self)
+        self.split_worker.progress.connect(self._on_split_progress)
+        self.split_worker.completed.connect(self._on_split_completed)
+        self.split_worker.failed.connect(self._on_worker_failed)
+        self.split_worker.finished.connect(self._on_split_worker_finished)
+        self.split_worker.start()
+
+    def _on_split_progress(self, current_index: int, total: int, current_fraction: float, message: str) -> None:
+        if total <= 0:
+            self._set_upload_progress(0, message)
+            return
+        completed_before = max(0, current_index - 1)
+        overall_fraction = (completed_before + max(0.0, min(1.0, current_fraction))) / total
+        percent = int(round(overall_fraction * 50))
+        self._set_upload_progress(percent, f"{message} ({current_index}/{total})")
+
+    def _on_split_completed(self, prepared_count: int) -> None:
+        self._populate_queue()
+        if prepared_count <= 0:
+            self._set_upload_controls_busy(False)
+            self._set_upload_progress(0, "업로드 대기")
+            QMessageBox.information(self, "업로드 대상 없음", "분할 후 업로드할 세그먼트가 없습니다.")
+            return
+        if self.pending_upload_source_path is not None:
+            answer = QMessageBox.question(
+                self,
+                "원본 파일 정리",
+                "분할 준비가 완료되었습니다.\n원본 영상 파일을 휴지통으로 이동할까요?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
             )
+            if answer == QMessageBox.Yes:
+                self._move_source_to_trash(self.pending_upload_source_path)
+        self._set_upload_progress(50, "분할 완료 · 업로드를 시작합니다...")
+        self.status_message("분할이 완료되어 YouTube 업로드를 시작합니다...")
+        youtube = self.ensure_youtube_client()
+        if youtube is None:
+            self._set_upload_controls_busy(False)
+            return
+        self.upload_worker = QueueUploadWorker(self.controller, youtube, self)
+        self.upload_worker.progress.connect(self._on_upload_progress)
+        self.upload_worker.completed.connect(self._on_upload_completed)
+        self.upload_worker.failed.connect(self._on_worker_failed)
+        self.upload_worker.finished.connect(self._on_upload_worker_finished)
+        self.upload_worker.start()
+
+    def _move_source_to_trash(self, source_path: Path) -> None:
+        try:
+            moved = QFile.moveToTrash(str(source_path))
         except Exception as exc:
-            self.upload_queue_btn.setEnabled(True)
-            QMessageBox.critical(self, "업로드 실패", str(exc))
+            QMessageBox.warning(self, "원본 파일 정리 실패", f"원본 파일을 휴지통으로 이동하지 못했습니다.\n\n{exc}")
+            return
+        if not moved:
+            QMessageBox.warning(self, "원본 파일 정리 실패", "원본 파일을 휴지통으로 이동하지 못했습니다.")
+            return
+        self.status_message(f"원본 파일을 휴지통으로 이동했습니다: {source_path.name}")
+
+    def _on_upload_completed(self, summary: object) -> None:
+        self._set_upload_controls_busy(False)
+        if not hasattr(summary, "total"):
+            QMessageBox.critical(self, "업로드 실패", "업로드 결과 형식이 올바르지 않습니다.")
             return
         self._populate_queue()
         if summary.failed == 0 and summary.total > 0:
             self.clear_saved_session()
         else:
             self.save_session_now(silent=True)
-        self.upload_queue_btn.setEnabled(True)
+        if self.refresh_uploaded_videos is not None:
+            self._set_upload_progress(98, "업로드 완료 · 채널 목록 동기화 중...")
+            try:
+                self.refresh_uploaded_videos()
+            except Exception as exc:
+                QMessageBox.warning(self, "채널 동기화 실패", f"업로드 후 영상 목록을 새로고침하지 못했습니다.\n\n{exc}")
         if summary.total > 0:
             self._set_upload_progress(100, f"업로드 완료 · 성공 {summary.succeeded} / 실패 {summary.failed}")
         else:
             self._set_upload_progress(0, "업로드 대기")
         QMessageBox.information(self, "업로드 완료", f"성공 {summary.succeeded}개 / 실패 {summary.failed}개 / 전체 {summary.total}개")
         self.status_message(f"로컬 세그먼트 업로드 완료: 성공 {summary.succeeded}, 실패 {summary.failed}")
+
+    def _on_worker_failed(self, message: str) -> None:
+        self._set_upload_controls_busy(False)
+        self._set_upload_progress(0, "업로드 대기")
+        QMessageBox.critical(self, "업로드 실패", message)
+
+    def _on_split_worker_finished(self) -> None:
+        self.split_worker = None
+
+    def _on_upload_worker_finished(self) -> None:
+        self.upload_worker = None
+
+    def _set_upload_controls_busy(self, busy: bool) -> None:
+        self.upload_queue_btn.setEnabled(not busy)
+        self.insert_cut_btn.setEnabled(not busy)
+        self.capture_thumb_btn.setEnabled(not busy)
+        self.play_btn.setEnabled(not busy)
+        self.prev_keyframe_btn.setEnabled(not busy)
+        self.next_keyframe_btn.setEnabled(not busy)
+        self.prev_frame_btn.setEnabled(not busy)
+        self.next_frame_btn.setEnabled(not busy)
+        self.game_combo.setEnabled(not busy)
+        self.title_input.setEnabled(not busy)
+        self.date_input.setEnabled(not busy)
+        self.tags_input.setEnabled(not busy)
+        self.description_input.setEnabled(not busy)
+        self.privacy_combo.setEnabled(not busy)
+        self.keep_checkbox.setEnabled(not busy and self._selected_segment_index is not None)
+        self.segment_title_input.setEnabled(not busy and self._selected_segment_index is not None)
+        self.segment_tags_input.setEnabled(not busy and self._selected_segment_index is not None)
+        self.segment_description_input.setEnabled(not busy and self._selected_segment_index is not None)
+        self.segment_privacy_combo.setEnabled(not busy and self._selected_segment_index is not None)
+        self.apply_segment_changes_btn.setEnabled(not busy and self._selected_segment_index is not None)
+        self.reset_segment_changes_btn.setEnabled(not busy and self._selected_segment_index is not None)
+        self.segment_card_list.setEnabled(not busy)
 
     def toggle_playback(self) -> None:
         if self.controller.session is None:
@@ -1136,7 +1286,7 @@ class LocalUploadWidget(QWidget):
             return
         completed_before = max(0, current_index - 1)
         overall_fraction = (completed_before + max(0.0, min(1.0, current_fraction))) / total
-        percent = int(round(overall_fraction * 100))
+        percent = 50 + int(round(overall_fraction * 50))
         self._set_upload_progress(percent, f"{message} ({current_index}/{total})")
         QApplication.processEvents()
 

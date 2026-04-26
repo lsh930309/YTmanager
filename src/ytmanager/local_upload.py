@@ -386,16 +386,41 @@ class LocalUploadController:
         self.queue = [UploadQueueItem(segment=segment) for segment in session.segments if segment.keep]
         return self.queue
 
-    def process_queue(
+    def prepare_queue_files(
         self,
-        youtube_client: Any,
         *,
         ffmpeg_path: Path | str,
         output_dir: Path,
         source_path: Path | None = None,
         progress_callback: ProgressCallback | None = None,
-    ) -> UploadProcessSummary:
+    ) -> list[UploadQueueItem]:
         session = self.require_session()
+        if not self.queue:
+            self.build_queue()
+        total = len(self.queue)
+        for position, item in enumerate(self.queue, start=1):
+            item.status = QUEUE_STATUS_PROCESSING
+            item.error_message = ""
+            if progress_callback is not None:
+                progress_callback(position, total, 0.0, f"분할 준비 중 · {item.segment.title}")
+            outputs = self.splitter(
+                source_path or session.source_path,
+                [item.segment],
+                output_dir,
+                Path(ffmpeg_path),
+            )
+            item.output_path = outputs[0]
+            item.status = QUEUE_STATUS_PENDING
+            if progress_callback is not None:
+                progress_callback(position, total, 1.0, f"분할 완료 · {item.segment.title}")
+        return list(self.queue)
+
+    def upload_prepared_queue(
+        self,
+        youtube_client: Any,
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> UploadProcessSummary:
         if not self.queue:
             self.build_queue()
         succeeded = 0
@@ -404,18 +429,14 @@ class LocalUploadController:
         for position, item in enumerate(self.queue, start=1):
             item.status = QUEUE_STATUS_PROCESSING
             item.error_message = ""
-            if progress_callback is not None:
-                progress_callback(position, total, 0.0, f"분할 준비 중 · {item.segment.title}")
-            try:
-                outputs = self.splitter(
-                    source_path or session.source_path,
-                    [item.segment],
-                    output_dir,
-                    Path(ffmpeg_path),
-                )
-                item.output_path = outputs[0]
+            if item.output_path is None or not Path(item.output_path).exists():
+                item.status = QUEUE_STATUS_FAILED
+                item.error_message = "업로드할 분할 파일이 준비되지 않았습니다."
+                failed += 1
                 if progress_callback is not None:
-                    progress_callback(position, total, 0.1, f"업로드 준비 완료 · {item.segment.title}")
+                    progress_callback(position, total, 1.0, f"업로드 실패 · {item.segment.title}")
+                continue
+            try:
                 response = self.uploader(
                     youtube_client,
                     title=item.segment.title,
@@ -429,7 +450,7 @@ class LocalUploadController:
                         else lambda fraction, position=position, total=total, title=item.segment.title: progress_callback(
                             position,
                             total,
-                            0.1 + max(0.0, min(1.0, fraction)) * 0.9,
+                            max(0.0, min(1.0, fraction)),
                             f"업로드 중 · {title}",
                         )
                     ),
