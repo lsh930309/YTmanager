@@ -4,8 +4,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-from PySide6.QtCore import QSignalBlocker, QSize, QTimer, QUrl, Qt
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QSignalBlocker, QSize, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -24,7 +24,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
-    QSlider,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -32,7 +31,6 @@ from PySide6.QtWidgets import (
 
 from ytmanager.ffmpeg_tools import (
     FFmpegToolchain,
-    FFmpegToolsError,
     capture_video_frame,
     probe_local_video,
     resolve_ffmpeg_toolchain,
@@ -45,7 +43,6 @@ from ytmanager.local_upload import (
     QUEUE_STATUS_PROCESSING,
     QUEUE_STATUS_UPLOADED,
     LocalUploadController,
-    LocalVideoProbe,
     build_segment_title,
     upload_local_video_segment,
 )
@@ -57,6 +54,7 @@ from ytmanager.youtube_api import YouTubeApiClient
 CARD_THUMB_WIDTH = 160
 CARD_THUMB_HEIGHT = 90
 AUTOSAVE_DEBOUNCE_MS = 400
+TIMELINE_HEIGHT = 56
 
 
 class AspectRatioVideoFrame(QWidget):
@@ -84,14 +82,146 @@ class AspectRatioVideoFrame(QWidget):
         self.child.setGeometry(self.rect())
 
 
-class SegmentCardWidget(QFrame):
+class SegmentTimelineWidget(QWidget):
+    scrubStarted = Signal()
+    scrubbed = Signal(float)
+    scrubFinished = Signal(float, int)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setMinimumHeight(TIMELINE_HEIGHT)
+        self.setMouseTracking(True)
+        self.duration_seconds = 0.0
+        self.segments = []
+        self.cut_seconds: list[float] = []
+        self.current_seconds = 0.0
+        self.selected_index: int | None = None
+        self.active_index: int | None = None
+        self._scrubbing = False
+
+    def set_state(
+        self,
+        *,
+        duration_seconds: float,
+        segments: list,
+        cut_seconds: list[float],
+        current_seconds: float,
+        selected_index: int | None,
+        active_index: int | None,
+    ) -> None:
+        self.duration_seconds = max(0.0, duration_seconds)
+        self.segments = list(segments)
+        self.cut_seconds = list(cut_seconds)
+        self.current_seconds = max(0.0, current_seconds)
+        self.selected_index = selected_index
+        self.active_index = active_index
+        self.update()
+
+    def sizeHint(self) -> QSize:  # type: ignore[override]
+        return QSize(600, TIMELINE_HEIGHT)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() != Qt.LeftButton or self.duration_seconds <= 0:
+            return
+        self._scrubbing = True
+        self.scrubStarted.emit()
+        seconds = self._seconds_from_x(event.position().x())
+        self.scrubbed.emit(seconds)
+        self.update()
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if not self._scrubbing or self.duration_seconds <= 0:
+            return
+        self.scrubbed.emit(self._seconds_from_x(event.position().x()))
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if not self._scrubbing or self.duration_seconds <= 0:
+            return
+        self._scrubbing = False
+        seconds = self._seconds_from_x(event.position().x())
+        self.scrubFinished.emit(seconds, self._segment_index_for_seconds(seconds))
+        event.accept()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        rect = self.rect().adjusted(8, 14, -8, -10)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#111"))
+        painter.drawRoundedRect(rect, 8, 8)
+        if self.duration_seconds <= 0 or not self.segments:
+            painter.setPen(QColor("#777"))
+            painter.drawText(rect, Qt.AlignCenter, "세그먼트 없음")
+            return
+
+        for segment in self.segments:
+            start_x = rect.left() + int(rect.width() * (segment.start_seconds / self.duration_seconds))
+            end_x = rect.left() + int(rect.width() * (segment.end_seconds / self.duration_seconds))
+            width = max(4, end_x - start_x)
+            seg_rect = rect.adjusted(start_x - rect.left(), 0, -(rect.right() - end_x), 0)
+            if segment.keep:
+                fill = QColor("#255f35")
+            else:
+                fill = QColor("#3b3b3b")
+            if segment.index == self.active_index:
+                fill = QColor("#2e7d32") if segment.keep else QColor("#555555")
+            if segment.index == self.selected_index:
+                fill = QColor("#1565c0")
+            painter.setBrush(fill)
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(seg_rect.adjusted(0, 0, 0 if width > 8 else 0, 0), 6, 6)
+            if width >= 26:
+                painter.setPen(QColor("#f5f5f5"))
+                painter.drawText(seg_rect.adjusted(6, 0, -6, 0), Qt.AlignVCenter | Qt.AlignLeft, f"{segment.index}")
+
+        painter.setPen(QPen(QColor("#ffb74d"), 2))
+        for cut_seconds in self.cut_seconds:
+            x = rect.left() + int(rect.width() * (cut_seconds / self.duration_seconds))
+            painter.drawLine(x, rect.top() - 2, x, rect.bottom() + 2)
+
+        playhead_x = rect.left() + int(rect.width() * (min(self.current_seconds, self.duration_seconds) / self.duration_seconds))
+        painter.setPen(QPen(QColor("#ff5252"), 2))
+        painter.drawLine(playhead_x, rect.top() - 6, playhead_x, rect.bottom() + 6)
+
+    def _seconds_from_x(self, x: float) -> float:
+        rect = self.rect().adjusted(8, 14, -8, -10)
+        if rect.width() <= 0 or self.duration_seconds <= 0:
+            return 0.0
+        clamped = min(max(x, rect.left()), rect.right())
+        ratio = (clamped - rect.left()) / max(1.0, rect.width())
+        return max(0.0, min(self.duration_seconds, self.duration_seconds * ratio))
+
+    def _segment_index_for_seconds(self, seconds: float) -> int:
+        for segment in self.segments:
+            is_last = segment.index == len(self.segments)
+            if segment.start_seconds <= seconds < segment.end_seconds or (is_last and seconds <= segment.end_seconds):
+                return segment.index
+        return 1 if self.segments else 0
+
+
+class SegmentCardWidget(QFrame):
+    keepToggled = Signal(int, bool)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.segment_index = 0
         self.setObjectName("segmentCard")
         self.setFrameShape(QFrame.StyledPanel)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
+
+        header = QHBoxLayout()
+        self.status_label = QLabel()
+        self.keep_checkbox = QCheckBox("사용")
+        self.keep_checkbox.stateChanged.connect(self._emit_keep_toggled)
+        header.addWidget(self.status_label)
+        header.addStretch(1)
+        header.addWidget(self.keep_checkbox)
+        layout.addLayout(header)
 
         self.thumbnail_label = QLabel("썸네일 없음")
         self.thumbnail_label.setAlignment(Qt.AlignCenter)
@@ -99,20 +229,20 @@ class SegmentCardWidget(QFrame):
         self.thumbnail_label.setStyleSheet("background:#111;border:1px solid #333;color:#aaa;")
         layout.addWidget(self.thumbnail_label, alignment=Qt.AlignCenter)
 
-        self.status_label = QLabel()
         self.time_label = QLabel()
         self.title_label = QLabel()
         self.title_label.setWordWrap(True)
         self.title_label.setMaximumWidth(CARD_THUMB_WIDTH)
         self.title_label.setStyleSheet("font-weight:600;")
-        layout.addWidget(self.status_label)
         layout.addWidget(self.time_label)
         layout.addWidget(self.title_label)
         self._set_frame_style(False, False, True)
 
     def update_card(self, segment, *, active: bool, selected: bool) -> None:
-        status = "KEEP" if segment.keep else "SKIP"
-        self.status_label.setText(f"{segment.index:02d}. [{status}]")
+        self.segment_index = segment.index
+        self.status_label.setText(f"#{segment.index:02d}")
+        with QSignalBlocker(self.keep_checkbox):
+            self.keep_checkbox.setChecked(segment.keep)
         self.time_label.setText(f"{format_timestamp(segment.start_seconds)} ~ {format_timestamp(segment.end_seconds)}")
         self.title_label.setText(segment.title or "제목 없음")
         thumb_path = Path(segment.thumbnail_path) if segment.thumbnail_path else None
@@ -129,6 +259,9 @@ class SegmentCardWidget(QFrame):
             self.thumbnail_label.setPixmap(QPixmap())
             self.thumbnail_label.setText("썸네일 없음")
         self._set_frame_style(active, selected, segment.keep)
+
+    def _emit_keep_toggled(self, state: int) -> None:
+        self.keepToggled.emit(self.segment_index, state == Qt.Checked)
 
     def _set_frame_style(self, active: bool, selected: bool, keep: bool) -> None:
         border = "#1565c0" if selected else ("#2e7d32" if active else "#333")
@@ -166,8 +299,8 @@ class LocalUploadWidget(QWidget):
         self._selected_segment_index: int | None = None
         self._active_segment_index: int | None = None
         self._scrub_resume_playback = False
-        self._slider_dragging = False
         self.restored_session_loaded = False
+        self._segment_editor_dirty = False
 
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
@@ -294,22 +427,21 @@ class LocalUploadWidget(QWidget):
         center_layout.addLayout(controls_row)
 
         timeline_row = QHBoxLayout()
-        self.position_slider = QSlider(Qt.Horizontal)
-        self.position_slider.setRange(0, 0)
-        self.position_slider.sliderPressed.connect(self._on_slider_pressed)
-        self.position_slider.sliderMoved.connect(self._seek_slider_position)
-        self.position_slider.sliderReleased.connect(self._on_slider_released)
+        self.timeline_widget = SegmentTimelineWidget(self)
+        self.timeline_widget.scrubStarted.connect(self._on_timeline_scrub_started)
+        self.timeline_widget.scrubbed.connect(self._on_timeline_scrubbed)
+        self.timeline_widget.scrubFinished.connect(self._on_timeline_scrub_finished)
         self.insert_cut_btn = QPushButton("✂")
         self.insert_cut_btn.setToolTip("현재 위치에 컷 삽입")
         self.insert_cut_btn.clicked.connect(self.add_cut_from_current_position)
-        timeline_row.addWidget(self.position_slider, stretch=1)
+        timeline_row.addWidget(self.timeline_widget, stretch=1)
         timeline_row.addWidget(self.insert_cut_btn)
         center_layout.addLayout(timeline_row)
         center_layout.addStretch(1)
         top_splitter.addWidget(center)
 
         right = QWidget()
-        right.setMinimumWidth(380)
+        right.setMinimumWidth(400)
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(8)
@@ -352,23 +484,33 @@ class LocalUploadWidget(QWidget):
         segment_meta_layout = QFormLayout(segment_meta_group)
         self.selected_segment_summary = QLabel("선택된 세그먼트 없음")
         self.keep_checkbox = QCheckBox("업로드 유지")
-        self.keep_checkbox.stateChanged.connect(self._save_selected_segment)
+        self.keep_checkbox.stateChanged.connect(self._toggle_selected_segment_keep)
         self.segment_title_input = QLineEdit()
-        self.segment_title_input.textChanged.connect(self._save_selected_segment)
+        self.segment_title_input.textChanged.connect(self._mark_segment_editor_dirty)
         self.segment_tags_input = QLineEdit()
-        self.segment_tags_input.textChanged.connect(self._save_selected_segment)
+        self.segment_tags_input.textChanged.connect(self._mark_segment_editor_dirty)
         self.segment_description_input = QPlainTextEdit()
-        self.segment_description_input.textChanged.connect(self._save_selected_segment)
+        self.segment_description_input.textChanged.connect(self._mark_segment_editor_dirty)
         self.segment_privacy_combo = QComboBox()
         for value, label in (("private", "비공개"), ("unlisted", "일부 공개"), ("public", "공개")):
             self.segment_privacy_combo.addItem(label, value)
-        self.segment_privacy_combo.currentIndexChanged.connect(self._save_selected_segment)
+        self.segment_privacy_combo.currentIndexChanged.connect(self._mark_segment_editor_dirty)
+        self.segment_dirty_label = QLabel("변경 없음")
+        action_row = QHBoxLayout()
+        self.apply_segment_changes_btn = QPushButton("세그먼트 변경 적용")
+        self.apply_segment_changes_btn.clicked.connect(self.apply_segment_editor_changes)
+        self.reset_segment_changes_btn = QPushButton("편집값 되돌리기")
+        self.reset_segment_changes_btn.clicked.connect(self.reset_segment_editor_changes)
+        action_row.addWidget(self.apply_segment_changes_btn)
+        action_row.addWidget(self.reset_segment_changes_btn)
         segment_meta_layout.addRow("요약", self.selected_segment_summary)
         segment_meta_layout.addRow("유지", self.keep_checkbox)
         segment_meta_layout.addRow("제목", self.segment_title_input)
         segment_meta_layout.addRow("태그", self.segment_tags_input)
         segment_meta_layout.addRow("설명", self.segment_description_input)
         segment_meta_layout.addRow("공개범위", self.segment_privacy_combo)
+        segment_meta_layout.addRow("상태", self.segment_dirty_label)
+        segment_meta_layout.addRow("", action_row)
         right_layout.addWidget(segment_meta_group, stretch=1)
         top_splitter.addWidget(right)
         top_splitter.setSizes([980, 420])
@@ -404,6 +546,14 @@ class LocalUploadWidget(QWidget):
     def has_active_session(self) -> bool:
         return self.controller.session is not None
 
+    def is_text_input_focused(self) -> bool:
+        focus = self.focusWidget()
+        while focus:
+            if isinstance(focus, (QLineEdit, QPlainTextEdit)):
+                return True
+            focus = focus.parentWidget()
+        return False
+
     def _restore_autosave_session(self) -> None:
         restored = self.controller.restore_autosave()
         if restored is None:
@@ -415,16 +565,13 @@ class LocalUploadWidget(QWidget):
             self.player.pause()
             self._populate_common_fields_from_session(session)
             self._refresh_session_labels()
-            self._refresh_segment_cards(selected_index=selected_index)
+            self._rebuild_segment_cards(selected_index=selected_index or 1)
             self._populate_queue()
-            if selected_index is not None:
-                self._select_segment(selected_index)
-            elif session.segments:
-                self._select_segment(1)
-            if current_position_ms is not None:
-                self.player.setPosition(current_position_ms)
+            self._sync_timeline_state(current_seconds=(current_position_ms or 0) / 1000)
         finally:
             self._loading = False
+        if current_position_ms is not None:
+            self.player.setPosition(current_position_ms)
         self.restored_session_loaded = True
         self._mark_saved("이전 로컬 편집 세션을 복원했습니다.")
 
@@ -505,9 +652,9 @@ class LocalUploadWidget(QWidget):
             self._active_segment_index = None
             self._populate_common_fields_from_session(session)
             self._refresh_session_labels()
-            self._refresh_segment_cards(selected_index=1)
+            self._rebuild_segment_cards(selected_index=1)
             self._populate_queue()
-            self._select_segment(1)
+            self._sync_timeline_state(current_seconds=0.0)
         finally:
             self._loading = False
         self.save_session_now(silent=True)
@@ -526,40 +673,52 @@ class LocalUploadWidget(QWidget):
         self._set_combo_data(self.privacy_combo, session.privacy_status or DEFAULT_PRIVACY_STATUS)
         self._refresh_title_preview_only(schedule_autosave=False)
 
-    def _refresh_segment_cards(self, *, selected_index: int | None = None) -> None:
+    def _rebuild_segment_cards(self, *, selected_index: int | None = None) -> None:
         self.segment_card_list.clear()
         session = self.controller.session
         if session is None:
+            self._selected_segment_index = None
+            self._refresh_segment_editor_enabled(False)
             return
-        current_index = selected_index if selected_index is not None else self._selected_segment_index
         for segment in session.segments:
             item = QListWidgetItem()
             item.setData(Qt.UserRole, segment.index)
-            item.setSizeHint(QSize(CARD_THUMB_WIDTH + 24, 188))
+            item.setSizeHint(QSize(CARD_THUMB_WIDTH + 28, 220))
             widget = SegmentCardWidget(self.segment_card_list)
-            widget.update_card(segment, active=segment.index == self._active_segment_index, selected=segment.index == current_index)
+            widget.keepToggled.connect(self._on_card_keep_toggled)
             self.segment_card_list.addItem(item)
             self.segment_card_list.setItemWidget(item, widget)
-        if current_index is not None:
-            self._select_segment(current_index)
-        self._update_segment_card_styles()
+            self._refresh_segment_card_widget(segment.index)
+        target_index = selected_index or self._selected_segment_index or (session.segments[0].index if session.segments else None)
+        if target_index is not None:
+            self._select_segment(target_index)
+        self._refresh_segment_editor_enabled(self._selected_segment_index is not None)
 
-    def _update_segment_card_styles(self) -> None:
+    def _refresh_segment_card_widget(self, index: int) -> None:
         session = self.controller.session
         if session is None:
             return
         for row in range(self.segment_card_list.count()):
             item = self.segment_card_list.item(row)
-            index = int(item.data(Qt.UserRole) or 0)
+            if int(item.data(Qt.UserRole) or 0) != index:
+                continue
             widget = self.segment_card_list.itemWidget(item)
             if not isinstance(widget, SegmentCardWidget):
-                continue
+                return
             segment = self.controller.require_segment(index)
             widget.update_card(
                 segment,
                 active=index == self._active_segment_index,
                 selected=index == self._selected_segment_index,
             )
+            return
+
+    def _refresh_all_segment_card_widgets(self) -> None:
+        session = self.controller.session
+        if session is None:
+            return
+        for segment in session.segments:
+            self._refresh_segment_card_widget(segment.index)
 
     def _populate_queue(self) -> None:
         self.queue_list.clear()
@@ -574,6 +733,27 @@ class LocalUploadWidget(QWidget):
             if item.error_message:
                 line = f"{line}\n{item.error_message}"
             self.queue_list.addItem(line)
+
+    def _sync_timeline_state(self, *, current_seconds: float | None = None) -> None:
+        session = self.controller.session
+        if session is None:
+            self.timeline_widget.set_state(
+                duration_seconds=0.0,
+                segments=[],
+                cut_seconds=[],
+                current_seconds=0.0,
+                selected_index=None,
+                active_index=None,
+            )
+            return
+        self.timeline_widget.set_state(
+            duration_seconds=session.probe.duration_seconds,
+            segments=session.segments,
+            cut_seconds=self.controller.cut_seconds(session),
+            current_seconds=current_seconds if current_seconds is not None else self.player.position() / 1000,
+            selected_index=self._selected_segment_index,
+            active_index=self._active_segment_index,
+        )
 
     def _refresh_title_preview_only(self, schedule_autosave: bool = True) -> None:
         session = self.controller.session
@@ -613,7 +793,13 @@ class LocalUploadWidget(QWidget):
             privacy_status=str(self.privacy_combo.currentData() or DEFAULT_PRIVACY_STATUS),
         )
         self.controller.overwrite_segment_defaults()
-        self._after_session_mutation("공통 메타데이터를 세그먼트 초안에 복제했습니다.")
+        self.controller.build_queue()
+        self._refresh_session_labels()
+        self._refresh_all_segment_card_widgets()
+        self._populate_queue()
+        self._sync_timeline_state()
+        self._schedule_autosave()
+        self.status_message("공통 메타데이터를 세그먼트 초안에 복제했습니다.")
 
     def add_cut_from_current_position(self) -> None:
         session = self.controller.session
@@ -633,7 +819,13 @@ class LocalUploadWidget(QWidget):
             QMessageBox.warning(self, "컷 추가 실패", str(exc))
             return
         active_index = self.controller.active_segment_index(seconds) or self._selected_segment_index or 1
-        self._after_session_mutation(f"컷포인트 추가: {format_timestamp(seconds)}", select_index=active_index)
+        self.controller.build_queue()
+        self._refresh_session_labels()
+        self._rebuild_segment_cards(selected_index=active_index)
+        self._populate_queue()
+        self._sync_timeline_state(current_seconds=seconds)
+        self._schedule_autosave()
+        self.status_message(f"컷포인트 추가: {format_timestamp(seconds)}")
 
     def remove_selected_cut(self) -> None:
         session = self.controller.session
@@ -645,8 +837,14 @@ class LocalUploadWidget(QWidget):
             return
         cut_seconds = session.cuts[index - 2].seconds
         self.controller.remove_cut(cut_seconds)
-        next_index = min(index - 1, len(self.controller.require_session().segments))
-        self._after_session_mutation(f"컷포인트 삭제: {format_timestamp(cut_seconds)}", select_index=max(1, next_index))
+        self.controller.build_queue()
+        next_index = max(1, min(index - 1, len(self.controller.require_session().segments)))
+        self._refresh_session_labels()
+        self._rebuild_segment_cards(selected_index=next_index)
+        self._populate_queue()
+        self._sync_timeline_state(current_seconds=self.player.position() / 1000)
+        self._schedule_autosave()
+        self.status_message(f"컷포인트 삭제: {format_timestamp(cut_seconds)}")
 
     def _on_segment_selected(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
         del previous
@@ -654,25 +852,31 @@ class LocalUploadWidget(QWidget):
             self._selected_segment_index = None
             self.selected_segment_summary.setText("선택된 세그먼트 없음")
             self._refresh_segment_editor_enabled(False)
-            self._update_segment_card_styles()
+            self._sync_timeline_state()
+            self._refresh_all_segment_card_widgets()
             return
-        index = int(current.data(Qt.UserRole) or 0)
-        self._selected_segment_index = index
-        segment = self.controller.require_segment(index)
+        self._selected_segment_index = int(current.data(Qt.UserRole) or 0)
+        segment = self.controller.require_segment(self._selected_segment_index)
+        self._populate_segment_editor(segment)
+        self._refresh_segment_editor_enabled(True)
+        self._sync_timeline_state()
+        self._refresh_all_segment_card_widgets()
+
+    def _populate_segment_editor(self, segment) -> None:
         self._loading = True
         try:
             self.selected_segment_summary.setText(
-                f"{index:02d}. {format_timestamp(segment.start_seconds)} ~ {format_timestamp(segment.end_seconds)}"
+                f"{segment.index:02d}. {format_timestamp(segment.start_seconds)} ~ {format_timestamp(segment.end_seconds)}"
             )
             self.keep_checkbox.setChecked(segment.keep)
             self.segment_title_input.setText(segment.title)
             self.segment_tags_input.setText(" ".join(segment.tags))
             self.segment_description_input.setPlainText(segment.description)
             self._set_combo_data(self.segment_privacy_combo, segment.privacy_status)
+            self._segment_editor_dirty = False
+            self.segment_dirty_label.setText("변경 없음")
         finally:
             self._loading = False
-        self._refresh_segment_editor_enabled(True)
-        self._update_segment_card_styles()
 
     def _refresh_segment_editor_enabled(self, enabled: bool) -> None:
         for widget in (
@@ -681,30 +885,72 @@ class LocalUploadWidget(QWidget):
             self.segment_tags_input,
             self.segment_description_input,
             self.segment_privacy_combo,
+            self.apply_segment_changes_btn,
+            self.reset_segment_changes_btn,
         ):
             widget.setEnabled(enabled)
 
-    def _save_selected_segment(self) -> None:
+    def _mark_segment_editor_dirty(self) -> None:
         if self._loading or self._selected_segment_index is None:
+            return
+        self._segment_editor_dirty = True
+        self.segment_dirty_label.setText("적용 대기")
+
+    def apply_segment_editor_changes(self) -> None:
+        if self._selected_segment_index is None:
+            return
+        self._apply_segment_editor_changes(silent=False)
+
+    def _apply_segment_editor_changes(self, *, silent: bool) -> None:
+        if self._selected_segment_index is None or not self._segment_editor_dirty:
             return
         self.controller.update_segment(
             self._selected_segment_index,
-            keep=self.keep_checkbox.isChecked(),
             title=self.segment_title_input.text(),
             tags=self.segment_tags_input.text().split(),
             description=self.segment_description_input.toPlainText(),
             privacy_status=str(self.segment_privacy_combo.currentData() or DEFAULT_PRIVACY_STATUS),
         )
-        self._after_session_mutation(select_index=self._selected_segment_index)
-
-    def _after_session_mutation(self, message: str | None = None, *, select_index: int | None = None) -> None:
+        self._segment_editor_dirty = False
+        self.segment_dirty_label.setText("변경 없음")
         self.controller.build_queue()
         self._refresh_session_labels()
-        self._refresh_segment_cards(selected_index=select_index)
+        self._refresh_segment_card_widget(self._selected_segment_index)
         self._populate_queue()
+        self._sync_timeline_state()
         self._schedule_autosave()
-        if message:
-            self.status_message(message)
+        if not silent:
+            self.status_message("선택 세그먼트 변경을 적용했습니다.")
+
+    def reset_segment_editor_changes(self) -> None:
+        if self._selected_segment_index is None:
+            return
+        self._populate_segment_editor(self.controller.require_segment(self._selected_segment_index))
+
+    def _toggle_selected_segment_keep(self) -> None:
+        if self._loading or self._selected_segment_index is None:
+            return
+        self.controller.update_segment(self._selected_segment_index, keep=self.keep_checkbox.isChecked())
+        self.controller.build_queue()
+        self._refresh_session_labels()
+        self._refresh_segment_card_widget(self._selected_segment_index)
+        self._populate_queue()
+        self._sync_timeline_state()
+        self._schedule_autosave()
+
+    def _on_card_keep_toggled(self, index: int, checked: bool) -> None:
+        if self._loading:
+            return
+        self.controller.update_segment(index, keep=checked)
+        if index == self._selected_segment_index:
+            with QSignalBlocker(self.keep_checkbox):
+                self.keep_checkbox.setChecked(checked)
+        self.controller.build_queue()
+        self._refresh_session_labels()
+        self._refresh_segment_card_widget(index)
+        self._populate_queue()
+        self._sync_timeline_state()
+        self._schedule_autosave()
 
     def _schedule_autosave(self) -> None:
         if self._loading or self.controller.session is None:
@@ -720,6 +966,8 @@ class LocalUploadWidget(QWidget):
     def save_session_now(self, silent: bool = False) -> None:
         if self.controller.session is None:
             return
+        if self._segment_editor_dirty:
+            self._apply_segment_editor_changes(silent=True)
         self.controller.save_autosave(self._selected_segment_index, self.player.position())
         self._mark_saved(None if silent else "현재 로컬 편집 세션을 임시 저장했습니다.")
 
@@ -734,6 +982,8 @@ class LocalUploadWidget(QWidget):
         if self.controller.session is None:
             QMessageBox.information(self, "세션 필요", "먼저 로컬 영상을 선택하세요.")
             return
+        if self._segment_editor_dirty:
+            self._apply_segment_editor_changes(silent=True)
         if not self.controller.queue:
             self.controller.build_queue()
             self._populate_queue()
@@ -797,51 +1047,49 @@ class LocalUploadWidget(QWidget):
         if session is None:
             QMessageBox.information(self, "세션 필요", "먼저 로컬 영상을 선택하세요.")
             return
+        if self._segment_editor_dirty:
+            self._apply_segment_editor_changes(silent=True)
         index = self._selected_segment_index or self.controller.active_segment_index(self.player.position() / 1000) or 1
         try:
             toolchain = self._ensure_toolchain()
             output_dir = user_cache_dir() / "local-upload-thumbnails" / session.source_path.stem
             output_path = output_dir / f"segment-{index:02d}.jpg"
-            capture_video_frame(
-                session.source_path,
-                output_path,
-                self.player.position() / 1000,
-                toolchain.ffmpeg_path,
-            )
+            capture_video_frame(session.source_path, output_path, self.player.position() / 1000, toolchain.ffmpeg_path)
             self.controller.set_segment_thumbnail(index, output_path)
         except Exception as exc:
             QMessageBox.warning(self, "썸네일 캡처 실패", str(exc))
             return
-        self._after_session_mutation("선택 세그먼트 대표 썸네일을 저장했습니다.", select_index=index)
+        self._refresh_segment_card_widget(index)
+        self._sync_timeline_state()
+        self._schedule_autosave()
+        self.status_message("선택 세그먼트 대표 썸네일을 저장했습니다.")
 
-    def _on_slider_pressed(self) -> None:
-        self._slider_dragging = True
+    def _on_timeline_scrub_started(self) -> None:
         self._scrub_resume_playback = self.player.playbackState() == QMediaPlayer.PlayingState
         if self._scrub_resume_playback:
             self.player.pause()
 
-    def _seek_slider_position(self, value: int) -> None:
-        self.player.setPosition(value)
-        self._refresh_position_label(value, self.player.duration())
+    def _on_timeline_scrubbed(self, seconds: float) -> None:
+        self.player.setPosition(int(seconds * 1000))
+        self._refresh_position_label(int(seconds * 1000), self.player.duration())
 
-    def _on_slider_released(self) -> None:
-        self._slider_dragging = False
-        self.player.setPosition(self.position_slider.value())
+    def _on_timeline_scrub_finished(self, seconds: float, segment_index: int) -> None:
+        self.player.setPosition(int(seconds * 1000))
+        if segment_index:
+            self._select_segment(segment_index)
         if self._scrub_resume_playback:
             self.player.play()
         self._scrub_resume_playback = False
 
     def _on_position_changed(self, value: int) -> None:
-        if not self._slider_dragging:
-            with QSignalBlocker(self.position_slider):
-                self.position_slider.setValue(value)
         self._refresh_position_label(value, self.player.duration())
         self._active_segment_index = self.controller.active_segment_index(value / 1000) if self.controller.session else None
-        self._update_segment_card_styles()
+        self._sync_timeline_state(current_seconds=value / 1000)
+        self._refresh_all_segment_card_widgets()
 
     def _on_duration_changed(self, value: int) -> None:
-        self.position_slider.setRange(0, max(0, value))
         self._refresh_position_label(self.player.position(), value)
+        self._sync_timeline_state(current_seconds=self.player.position() / 1000)
 
     def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
         self.play_btn.setText("⏸" if state == QMediaPlayer.PlayingState else "⏵")

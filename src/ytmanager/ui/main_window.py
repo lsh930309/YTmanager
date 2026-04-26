@@ -1409,14 +1409,18 @@ class MainWindow(QMainWindow):
             self._player_shortcuts.append(shortcut)
 
     def _run_workspace_shortcut(self, action: Callable[[], None], block_when_typing: bool) -> None:
-        if block_when_typing and self._player_shortcut_blocked():
-            return
+        if block_when_typing:
+            if self._is_local_workspace_active():
+                if self.local_upload_widget.is_text_input_focused():
+                    return
+            elif self._player_shortcut_blocked():
+                return
         action()
 
     def _player_shortcut_blocked(self) -> bool:
         focus = self.focusWidget()
         while focus:
-            if isinstance(focus, (QLineEdit, QPlainTextEdit, QPushButton)):
+            if isinstance(focus, (QLineEdit, QPlainTextEdit)):
                 return True
             focus = focus.parentWidget()
         return False
