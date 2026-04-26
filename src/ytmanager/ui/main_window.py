@@ -534,7 +534,7 @@ class MainWindow(QMainWindow):
         workspace_row = QHBoxLayout()
         workspace_row.addWidget(QLabel("작업 공간"))
         self.metadata_workspace_btn = QRadioButton("YouTube 메타데이터")
-        self.local_workspace_btn = QRadioButton("로컬 업로드")
+        self.local_workspace_btn = QRadioButton("로컬 편집")
         self.metadata_workspace_btn.setChecked(True)
         self.metadata_workspace_btn.toggled.connect(lambda checked: self._set_workspace(0, checked))
         self.local_workspace_btn.toggled.connect(lambda checked: self._set_workspace(1, checked))
@@ -902,6 +902,8 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self.workspace_stack.addWidget(self.local_upload_widget)
+        if self.local_upload_widget.restored_session_loaded:
+            self.local_workspace_btn.setChecked(True)
 
         self.statusBar().showMessage("준비됨")
         self._rebuild_field_form(self._selected_template_name(), {})
@@ -927,7 +929,7 @@ class MainWindow(QMainWindow):
             return
         self.workspace_stack.setCurrentIndex(index)
         if index == 1:
-            self.statusBar().showMessage("로컬 업로드 작업 공간으로 전환했습니다.")
+            self.statusBar().showMessage("로컬 편집 작업 공간으로 전환했습니다.")
         else:
             self.statusBar().showMessage("YouTube 메타데이터 작업 공간으로 전환했습니다.")
 
@@ -1389,23 +1391,25 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("검수 완료 상태를 해제했습니다.")
 
     def _install_player_shortcuts(self) -> None:
-        shortcuts: tuple[tuple[int, Callable[[], None]], ...] = (
-            (Qt.Key_Space, self._toggle_player_playback),
-            (Qt.Key_Left, lambda: self._seek_player_relative(-KEYBOARD_SEEK_SECONDS)),
-            (Qt.Key_Right, lambda: self._seek_player_relative(KEYBOARD_SEEK_SECONDS)),
-            (Qt.Key_Comma, lambda: self._step_player_frame(-1)),
-            (Qt.Key_Period, lambda: self._step_player_frame(1)),
+        shortcuts: tuple[tuple[QKeySequence, Callable[[], None], bool], ...] = (
+            (QKeySequence(Qt.Key_Space), self._handle_space_shortcut, True),
+            (QKeySequence(Qt.Key_Left), self._handle_left_shortcut, True),
+            (QKeySequence(Qt.Key_Right), self._handle_right_shortcut, True),
+            (QKeySequence(Qt.Key_Comma), self._handle_comma_shortcut, True),
+            (QKeySequence(Qt.Key_Period), self._handle_period_shortcut, True),
+            (QKeySequence("Ctrl+P"), self._handle_ctrl_p_shortcut, False),
+            (QKeySequence("Ctrl+S"), self._handle_ctrl_s_shortcut, False),
         )
-        for key, action in shortcuts:
-            shortcut = QShortcut(QKeySequence(key), self)
+        for sequence, action, block_when_typing in shortcuts:
+            shortcut = QShortcut(sequence, self)
             shortcut.setContext(Qt.ApplicationShortcut)
-            shortcut.activated.connect(lambda action=action: self._run_player_shortcut(action))
+            shortcut.activated.connect(
+                lambda action=action, block_when_typing=block_when_typing: self._run_workspace_shortcut(action, block_when_typing)
+            )
             self._player_shortcuts.append(shortcut)
 
-    def _run_player_shortcut(self, action: Callable[[], None]) -> None:
-        if hasattr(self, "workspace_stack") and self.workspace_stack.currentIndex() != 0:
-            return
-        if not self.current_video or self._player_shortcut_blocked():
+    def _run_workspace_shortcut(self, action: Callable[[], None], block_when_typing: bool) -> None:
+        if block_when_typing and self._player_shortcut_blocked():
             return
         action()
 
@@ -1416,6 +1420,55 @@ class MainWindow(QMainWindow):
                 return True
             focus = focus.parentWidget()
         return False
+
+    def _is_local_workspace_active(self) -> bool:
+        return hasattr(self, "workspace_stack") and self.workspace_stack.currentIndex() == 1
+
+    def _handle_space_shortcut(self) -> None:
+        if self._is_local_workspace_active():
+            self.local_upload_widget.toggle_playback()
+            return
+        if self.current_video:
+            self._toggle_player_playback()
+
+    def _handle_left_shortcut(self) -> None:
+        if self._is_local_workspace_active():
+            self.local_upload_widget.seek_prev_keyframe()
+            return
+        if self.current_video:
+            self._seek_player_relative(-KEYBOARD_SEEK_SECONDS)
+
+    def _handle_right_shortcut(self) -> None:
+        if self._is_local_workspace_active():
+            self.local_upload_widget.seek_next_keyframe()
+            return
+        if self.current_video:
+            self._seek_player_relative(KEYBOARD_SEEK_SECONDS)
+
+    def _handle_comma_shortcut(self) -> None:
+        if self._is_local_workspace_active():
+            self.local_upload_widget.step_frame(-1)
+            return
+        if self.current_video:
+            self._step_player_frame(-1)
+
+    def _handle_period_shortcut(self) -> None:
+        if self._is_local_workspace_active():
+            self.local_upload_widget.step_frame(1)
+            return
+        if self.current_video:
+            self._step_player_frame(1)
+
+    def _handle_ctrl_p_shortcut(self) -> None:
+        if self._is_local_workspace_active():
+            self.local_upload_widget.capture_current_thumbnail()
+            return
+        if self.current_video:
+            self.capture_thumbnail_candidate()
+
+    def _handle_ctrl_s_shortcut(self) -> None:
+        if self._is_local_workspace_active():
+            self.local_upload_widget.save_session_now()
 
     def _toggle_player_playback(self) -> None:
         if not self.current_video:
@@ -1799,6 +1852,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if self._character_master_window is not None:
             self._character_master_window.close()
+        if hasattr(self, "local_upload_widget"):
+            self.local_upload_widget.persist_session_on_close()
         self.db.close()
         super().closeEvent(event)
 

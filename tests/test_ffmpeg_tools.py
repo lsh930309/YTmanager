@@ -4,7 +4,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ytmanager.ffmpeg_tools import build_ffmpeg_split_command, parse_ffprobe_keyframes, probe_local_video, read_probe_created_at
+from ytmanager.ffmpeg_tools import (
+    build_ffmpeg_frame_capture_command,
+    build_ffmpeg_split_command,
+    parse_ffprobe_keyframes,
+    parse_frame_rate,
+    probe_local_video,
+    read_probe_created_at,
+)
 
 
 class FFmpegToolsTests(unittest.TestCase):
@@ -18,10 +25,20 @@ class FFmpegToolsTests(unittest.TestCase):
         }
         self.assertEqual(parse_ffprobe_keyframes(payload), [0.0, 12.5, 24.25])
 
+    def test_parse_frame_rate(self):
+        self.assertAlmostEqual(parse_frame_rate("30000/1001"), 30000 / 1001)
+        self.assertEqual(parse_frame_rate("0/0"), 0.0)
+        self.assertEqual(parse_frame_rate("60"), 60.0)
+
     def test_build_ffmpeg_split_command(self):
         command = build_ffmpeg_split_command(Path("ffmpeg"), Path("input.mp4"), Path("output.mp4"), 12.5, 30.0)
         self.assertEqual(command[:6], ["ffmpeg", "-y", "-ss", "12.500", "-i", "input.mp4"])
         self.assertEqual(command[-1], "output.mp4")
+
+    def test_build_ffmpeg_frame_capture_command(self):
+        command = build_ffmpeg_frame_capture_command(Path("ffmpeg"), Path("input.mp4"), Path("frame.jpg"), 33.3)
+        self.assertEqual(command[:6], ["ffmpeg", "-y", "-ss", "33.300", "-i", "input.mp4"])
+        self.assertEqual(command[-1], "frame.jpg")
 
     def test_read_probe_created_at_prefers_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -40,7 +57,14 @@ class FFmpegToolsTests(unittest.TestCase):
                     stdout = json.dumps(
                         {
                             "format": {"duration": "120.0", "tags": {"creation_time": "2026-04-25T01:02:03Z"}},
-                            "streams": [{"codec_type": "video", "width": 1920, "height": 1080}],
+                            "streams": [
+                                {
+                                    "codec_type": "video",
+                                    "width": 1920,
+                                    "height": 1080,
+                                    "avg_frame_rate": "30000/1001",
+                                }
+                            ],
                         }
                     )
                 else:
@@ -52,6 +76,7 @@ class FFmpegToolsTests(unittest.TestCase):
             self.assertEqual((probe.width_pixels, probe.height_pixels), (1920, 1080))
             self.assertEqual(probe.created_at, "2026-04-25")
             self.assertEqual(probe.keyframes, (0.0, 15.0))
+            self.assertAlmostEqual(probe.frame_rate, 30000 / 1001)
 
 
 if __name__ == "__main__":

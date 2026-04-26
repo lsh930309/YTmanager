@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import platform
 import shutil
 import stat
@@ -15,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from ytmanager.local_upload import LocalVideoProbe, SegmentDraft
+from ytmanager.local_upload import DEFAULT_FRAME_RATE, LocalVideoProbe, SegmentDraft
 from ytmanager.paths import user_cache_dir
 
 FFMPEG_MANAGED_VERSION = "managed-latest"
@@ -175,12 +174,7 @@ def find_ffmpeg_binaries(root: Path) -> tuple[Path, Path]:
 
 
 def inspect_ffmpeg_version(ffmpeg_path: Path) -> str:
-    completed = subprocess.run(
-        [str(ffmpeg_path), "-version"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    completed = subprocess.run([str(ffmpeg_path), "-version"], capture_output=True, text=True, check=False)
     if completed.returncode != 0:
         raise FFmpegToolsError((completed.stderr or completed.stdout or "ffmpeg 버전 확인 실패").strip())
     first_line = (completed.stdout or "").splitlines()[0].strip()
@@ -284,15 +278,7 @@ def probe_local_video(
 
     metadata = _run_ffprobe_json(
         ffprobe,
-        [
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            str(source),
-        ],
+        ["-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(source)],
         runner=runner,
     )
     keyframes_payload = _run_ffprobe_json(
@@ -318,6 +304,7 @@ def probe_local_video(
     duration_seconds = _safe_float((metadata.get("format", {}) or {}).get("duration"))
     width_pixels = _safe_int(video_stream.get("width"))
     height_pixels = _safe_int(video_stream.get("height"))
+    frame_rate = read_video_frame_rate(video_stream)
     keyframes = tuple(parse_ffprobe_keyframes(keyframes_payload))
     created_at = read_probe_created_at(metadata, source)
     modified_at = datetime.fromtimestamp(source.stat().st_mtime).astimezone().date().isoformat()
@@ -328,6 +315,7 @@ def probe_local_video(
         created_at=created_at,
         modified_at=modified_at,
         keyframes=keyframes,
+        frame_rate=frame_rate,
     )
 
 
@@ -351,6 +339,30 @@ def parse_ffprobe_keyframes(payload: Mapping[str, Any]) -> list[float]:
             continue
         keyframes.append(seconds)
     return keyframes
+
+
+def read_video_frame_rate(stream: Mapping[str, Any]) -> float:
+    avg = parse_frame_rate(stream.get("avg_frame_rate"))
+    if avg > 0:
+        return avg
+    rate = parse_frame_rate(stream.get("r_frame_rate"))
+    if rate > 0:
+        return rate
+    return DEFAULT_FRAME_RATE
+
+
+def parse_frame_rate(value: Any) -> float:
+    if value in (None, "", "0/0"):
+        return 0.0
+    text = str(value).strip()
+    if "/" in text:
+        numerator_text, denominator_text = text.split("/", 1)
+        numerator = _safe_float(numerator_text)
+        denominator = _safe_float(denominator_text)
+        if denominator == 0:
+            return 0.0
+        return numerator / denominator
+    return _safe_float(text)
 
 
 def read_probe_created_at(payload: Mapping[str, Any], source_path: Path) -> str:
@@ -420,6 +432,48 @@ def build_ffmpeg_split_command(
         "make_zero",
         str(output_path),
     ]
+
+
+def build_ffmpeg_frame_capture_command(
+    ffmpeg_path: Path,
+    source_path: Path,
+    output_path: Path,
+    seconds: float,
+) -> list[str]:
+    return [
+        str(ffmpeg_path),
+        "-y",
+        "-ss",
+        format_seconds(seconds),
+        "-i",
+        str(source_path),
+        "-frames:v",
+        "1",
+        "-q:v",
+        "2",
+        str(output_path),
+    ]
+
+
+def capture_video_frame(
+    source_path: Path | str,
+    output_path: Path | str,
+    seconds: float,
+    ffmpeg_path: Path | str,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> Path:
+    source = Path(source_path)
+    target = Path(output_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    command = build_ffmpeg_frame_capture_command(Path(ffmpeg_path), source, target, seconds)
+    completed = runner(command, capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        stderr = (completed.stderr or completed.stdout or "").strip()
+        raise FFmpegToolsError(f"ffmpeg 프레임 캡처 실패: {stderr[:400] or completed.returncode}")
+    if not target.exists():
+        raise FFmpegToolsError(f"프레임 캡처 파일이 생성되지 않았습니다: {target}")
+    return target
 
 
 def format_seconds(value: float) -> str:

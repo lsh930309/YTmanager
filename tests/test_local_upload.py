@@ -1,9 +1,9 @@
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 from ytmanager.local_upload import (
+    DEFAULT_FRAME_RATE,
     LocalUploadController,
     LocalVideoProbe,
     build_segment_title,
@@ -33,6 +33,7 @@ class LocalUploadTests(unittest.TestCase):
                 created_at="2026-04-25",
                 modified_at="2026-04-26",
                 keyframes=(30.0, 60.0, 90.0),
+                frame_rate=29.97,
             )
 
         def splitter(source_path, segments, output_dir, ffmpeg_path):
@@ -70,6 +71,7 @@ class LocalUploadTests(unittest.TestCase):
         session = controller.load_source(self.video_path, ffprobe_path=Path("ffprobe"))
         self.assertEqual(session.date_text, "2026-04-25")
         self.assertEqual(self.db.get_setting("last_media_dir"), str(self.video_path.parent))
+        self.assertEqual(session.probe.frame_rate, 29.97)
         self.assertEqual(len(session.segments), 1)
 
     def test_cutpoints_create_segments_and_keep_discard(self):
@@ -132,6 +134,34 @@ class LocalUploadTests(unittest.TestCase):
             "[젠존제] 세그먼트 테스트 - 2026-04-25 (3/3)",
         ])
         self.assertEqual([item.status for item in summary.items], ["uploaded", "failed", "uploaded"])
+
+    def test_autosave_roundtrip_restores_selected_segment_and_position(self):
+        controller = self._build_controller()
+        controller.load_source(self.video_path, ffprobe_path=Path("ffprobe"))
+        controller.rebuild_segments([30, 60])
+        controller.update_segment(2, title="중간 구간")
+        controller.set_segment_thumbnail(2, Path(self.tempdir.name) / "thumb.jpg")
+        controller.save_autosave(selected_segment_index=2, current_position_ms=45678)
+
+        restored = self._build_controller().restore_autosave()
+        self.assertIsNotNone(restored)
+        session, selected_index, current_position_ms = restored
+        self.assertEqual(selected_index, 2)
+        self.assertEqual(current_position_ms, 45678)
+        self.assertEqual(session.segments[1].title, "중간 구간")
+        self.assertTrue(session.segments[1].thumbnail_path.endswith("thumb.jpg"))
+
+    def test_keyframe_navigation_uses_previous_and_next_boundaries(self):
+        controller = self._build_controller()
+        controller.load_source(self.video_path, ffprobe_path=Path("ffprobe"))
+        self.assertEqual(controller.keyframe_step_seconds(44.0, -1), 30.0)
+        self.assertEqual(controller.keyframe_step_seconds(44.0, 1), 60.0)
+        self.assertEqual(controller.keyframe_step_seconds(5.0, -1), 0.0)
+        self.assertEqual(controller.keyframe_step_seconds(110.0, 1), 120.0)
+
+    def test_effective_frame_rate_falls_back_to_default(self):
+        probe = LocalVideoProbe(duration_seconds=1.0, frame_rate=0.0)
+        self.assertEqual(probe.effective_frame_rate(), DEFAULT_FRAME_RATE)
 
 
 if __name__ == "__main__":
